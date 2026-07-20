@@ -1,0 +1,37 @@
+# SparkDash cluster configuration.
+#
+# Copy this to one of (searched in order):
+#   $SPARKDASH_CONFIG
+#   ~/.config/sparkdash/config.toml
+#   <repo>/sparkdash.toml
+# and fill in your own nodes. With no config file, SparkDash runs single-node
+# against localhost.
+
+ssh_user = "nvidia"           # SSH user shared across the cluster nodes
+sparkrun_cluster = "default"  # sparkrun saved-cluster name
+
+# One [[nodes]] block per machine.
+#   ip    - management address; must match the host keys that
+#           `sparkrun cluster monitor` reports for this node
+#   rdma  - optional fast-copy address (e.g. a direct-connect link) used for
+#           model mirroring; set equal to ip if you have no separate link
+#   local - true on the single node where SparkDash actually runs (the head)
+[[nodes]]
+name  = "head"
+ip    = "head.example"
+rdma  = "head.example"
+role  = "head"
+local = true
+
+[[nodes]]
+name  = "worker"
+ip    = "worker.example"
+rdma  = "worker.example"
+role  = "worker"
+local = false
+
+# Extra Subject Alternative Names for the auto-generated self-signed TLS cert,
+# so browsers accept the hostnames/addresses you use to reach the dashboard.
+[cert]
+hostnames = ["localhost"]
+ips       = ["127.0.0.1"]

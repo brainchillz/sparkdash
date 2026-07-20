@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets / tokens
+*-token
+*.token
+
+# Local runtime state (lives in ~/.local/share/sparkdash, but just in case)
+*.db
+*.db-wal
+*.db-shm
+certs/
+data/
+
+# Local cluster config (real addresses)
+sparkdash.toml
+config.toml

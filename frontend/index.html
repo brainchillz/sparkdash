@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SparkDash</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <h1>Spark<span class="accent">Dash</span></h1>
+  <div style="display:flex; gap:14px; align-items:center;">
+    <span class="meta" id="clock">—</span>
+    <span class="status-pill"><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></span>
+    <a class="btn" href="/admin">Admin</a>
+  </div>
+</header>
+
+<main>
+  <div class="grid top">
+    <div class="card" id="recipe-card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px">
+        <h2 style="margin:0">Recipe / Model</h2>
+        <button class="btn" id="logs-btn" onclick="openLogs()" disabled>View logs</button>
+      </div>
+      <div id="recipe-body"><span class="meta">waiting for data…</span></div>
+    </div>
+    <div class="card" id="ray-card">
+      <h2>Ray Cluster</h2>
+      <div id="ray-body"><span class="meta">waiting for data…</span></div>
+    </div>
+  </div>
+
+  <div class="card" id="vllm-card" style="margin-top:16px;">
+    <h2>Inference &mdash; vLLM Metrics</h2>
+    <div id="vllm-body"><span class="meta">waiting for data…</span></div>
+  </div>
+
+  <div class="grid nodes" id="nodes"></div>
+</main>
+
+<footer>SparkDash &middot; polling every 2s</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function fmtBytes(b) {
+  if (b == null) return "—";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (b >= 1024 && i < u.length-1) { b /= 1024; i++; }
+  return b.toFixed(b < 10 && i > 0 ? 1 : 0) + " " + u[i];
+}
+function fmtMB(mb) { return mb == null ? "—" : fmtBytes(mb * 1024 * 1024); }
+function fmtDuration(sec) {
+  if (sec == null) return "—";
+  const d = Math.floor(sec/86400), h = Math.floor((sec%86400)/3600), m = Math.floor((sec%3600)/60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+function pct(v) { return v == null ? "—" : v.toFixed(v < 10 ? 1 : 0) + "%"; }
+function sev(p) { return p == null ? "" : p >= 90 ? "bad" : p >= 75 ? "warn" : ""; }
+
+function bar(percent) {
+  const p = Math.max(0, Math.min(100, percent || 0));
+  return `<div class="bar"><span class="${sev(percent)}" style="width:${p}%"></span></div>`;
+}
+function kv(k, v) { return `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`; }
+
+// -- metric history (sparklines) -----------------------------------------
+const HIST_MAX = 150;   // ~5 min at 2s cadence
+const hist = {};
+function push(key, val) {
+  if (val == null || isNaN(val)) return;
+  (hist[key] = hist[key] || []).push(val);
+  if (hist[key].length > HIST_MAX) hist[key].shift();
+}
+function spark(key, { h = 22, color = "#58a6ff", fixedMax = null } = {}) {
+  const data = hist[key] || [];
+  if (data.length < 2) return "";
+  const vw = 300;
+  const mx = fixedMax != null ? fixedMax : Math.max(...data);
+  const mn = Math.min(...data, 0);
+  const range = (mx - mn) || 1;
+  const pts = data.map((v, i) =>
+    `${(i / (data.length - 1) * vw).toFixed(1)},${(h - ((v - mn) / range) * (h - 2) - 1).toFixed(1)}`).join(" ");
+  return `<svg width="100%" height="${h}" viewBox="0 0 ${vw} ${h}" preserveAspectRatio="none" style="display:block">` +
+    `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
+}
+function notify(title, body) {
+  if (localStorage.getItem("sd-notif") === "1" && "Notification" in window && Notification.permission === "granted") {
+    try { new Notification(title, { body }); } catch (_) {}
+  }
+}
+
+function renderRecipe(r) {
+  if (!r || !r.running) {
+    $("recipe-body").innerHTML = `<span class="meta">No recipe running.</span>`;
+    return;
+  }
+  const conts = (r.containers || []).map(c =>
+    `<span class="chip">${c.role} · <b>${c.ip}</b> · ${c.status}</span>`).join("");
+  $("recipe-body").innerHTML =
+    `<div class="big">${r.name} <span class="meta">tp=${r.tp}</span></div>
+     <div class="meta" style="margin:2px 0 12px">job ${r.id}</div>
+     <div class="chips">${conts}</div>`;
+}
+
+function renderRay(ray, vllm) {
+  if (!ray || !ray.reachable) {
+    $("ray-body").innerHTML = `<span class="meta">Ray dashboard unreachable.</span>`;
+  } else {
+    const nodes = (ray.nodes || []).map(n => {
+      const d = n.state === "ALIVE" ? "ok" : "bad";
+      const tag = n.is_head ? "head" : "worker";
+      return `<div class="kv"><span class="k"><span class="dot ${d}" style="display:inline-block;margin-right:6px"></span>${n.node_ip} <span class="meta">${tag}</span></span>` +
+             `<span class="v">${n.cpu ?? "—"} CPU · ${n.gpu ?? "—"} GPU · ${fmtBytes(n.memory_bytes)}</span></div>`;
+    }).join("");
+    $("ray-body").innerHTML =
+      kv("Nodes alive", `${ray.nodes_alive}/${ray.nodes_total}`) + nodes;
+  }
+  // vLLM health also surfaces here as a quick line.
+  const vd = vllm && vllm.healthy ? "ok" : (vllm && vllm.reachable ? "warn" : "bad");
+  const vt = vllm && vllm.healthy ? "healthy" : (vllm && vllm.reachable ? "reachable" : "down");
+  const model = vllm && vllm.model ? vllm.model : "—";
+  $("ray-body").innerHTML +=
+    `<div class="kv" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+       <span class="k"><span class="dot ${vd}" style="display:inline-block;margin-right:6px"></span>vLLM</span>
+       <span class="v">${vt}</span></div>` +
+    `<div class="model-name">${model}</div>` +
+    (vllm && vllm.max_model_len ? `<div class="meta">context ${(vllm.max_model_len/1000).toFixed(0)}k tokens</div>` : "");
+}
+
+function renderVllm(vllm) {
+  const m = (vllm && vllm.metrics) || {};
+  if (!vllm || !vllm.reachable) {
+    $("vllm-body").innerHTML = `<span class="meta">vLLM endpoint unreachable.</span>`;
+    return;
+  }
+  const running = m["vllm:num_requests_running"] ?? 0;
+  const waiting = m["vllm:num_requests_waiting"] ?? 0;
+  const kv_cache = (m["vllm:kv_cache_usage_perc"] ?? m["vllm:gpu_cache_usage_perc"]);
+  const hit = m["prefix_cache_hit_rate"];
+  const gen = m["vllm:generation_tokens_total"];
+  const prompt = m["vllm:prompt_tokens_total"];
+  const tps = (hist["tokps"] && hist["tokps"].length) ? hist["tokps"][hist["tokps"].length - 1] : null;
+  const metric = (num, lbl) => `<div class="metric"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`;
+  $("vllm-body").innerHTML = `<div class="metric-row">
+    ${metric(running, "requests running")}
+    ${metric(waiting, "requests waiting")}
+    ${metric(tps == null ? "—" : tps.toFixed(1), "tokens/sec")}
+    ${metric(kv_cache == null ? "—" : (kv_cache*100).toFixed(1)+"%", "KV cache used")}
+    ${metric(hit == null ? "—" : (hit*100).toFixed(1)+"%", "prefix cache hit")}
+    ${metric(gen == null ? "—" : Intl.NumberFormat().format(Math.round(gen)), "tokens generated")}
+  </div>
+  <div style="margin-top:12px">
+    <div class="top-line" style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted)"><span>generation throughput</span><span>${tps==null?"":tps.toFixed(1)+" tok/s"}</span></div>
+    ${spark("tokps", {h:30, color:"#3fb950"}) || `<span class="meta">gathering…</span>`}
+  </div>`;
+}
+
+function renderNodes(nodes) {
+  const host = $("nodes");
+  host.innerHTML = (nodes || []).map(n => {
+    const cls = n.online ? "" : "offline";
+    const d = n.online ? "ok" : "bad";
+    push("gpu:" + n.name, n.gpu_util_pct);
+    push("vram:" + n.name, n.vram_used_mb);
+    const memPct = n.mem_used_pct;
+    // VRAM shown against total RAM (unified memory on GB10).
+    const vramPct = (n.vram_used_mb != null && n.mem_total_mb) ? (n.vram_used_mb / n.mem_total_mb * 100) : null;
+    const diskPct = (n.disk_used && n.disk_total) ? (n.disk_used / n.disk_total * 100) : null;
+    return `<div class="card ${cls}">
+      <div class="node-head">
+        <div><span class="dot ${d}" style="display:inline-block;margin-right:8px"></span>
+          <span class="name">${n.name}</span><span class="role">${n.role}</span></div>
+        <span class="meta">${n.hostname || n.ip}</span>
+      </div>
+
+      <div class="stat">
+        <div class="top-line"><span>CPU</span><span class="sub">${pct(n.cpu_pct)} · load ${n.cpu_load_1m ?? "—"} · ${n.cpu_temp_c ?? "—"}°C</span></div>
+        ${bar(n.cpu_pct)}
+      </div>
+      <div class="stat">
+        <div class="top-line"><span>RAM</span><span class="sub">${fmtMB(n.mem_used_mb)} / ${fmtMB(n.mem_total_mb)} · ${pct(memPct)}</span></div>
+        ${bar(memPct)}
+      </div>
+      <div class="stat">
+        <div class="top-line"><span>VRAM <span class="meta">(per-proc)</span></span><span class="sub">${fmtMB(n.vram_used_mb)}${vramPct!=null?" · "+pct(vramPct):""}</span></div>
+        ${bar(vramPct)}
+      </div>
+      <div class="stat">
+        <div class="top-line"><span>Storage</span><span class="sub">${fmtBytes(n.disk_used)} / ${fmtBytes(n.disk_total)}</span></div>
+        ${bar(diskPct)}
+      </div>
+
+      <div class="chips">
+        <span class="chip">GPU <b>${n.gpu_name || "—"}</b></span>
+        <span class="chip">util <b>${pct(n.gpu_util_pct)}</b></span>
+        <span class="chip">${n.gpu_temp_c ?? "—"}°C</span>
+        <span class="chip">${n.gpu_power_w != null ? n.gpu_power_w.toFixed(0)+" W" : "—"}</span>
+        <span class="chip">${n.gpu_clock_mhz != null ? n.gpu_clock_mhz.toFixed(0)+" MHz" : "—"}</span>
+        <span class="chip">up <b>${fmtDuration(n.uptime_sec)}</b></span>
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="top-line" style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted)"><span>GPU util history</span><span>~5 min</span></div>
+        ${spark("gpu:"+n.name, {h:26, fixedMax:100, color:"#58a6ff"}) || `<span class="meta">gathering…</span>`}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function openLogs() {
+  window.open("/logs", "sparkdash-logs", "width=1100,height=720");
+}
+
+let _lastGen = null, _lastTs = null, _prevHealthy = null, _prevOnline = {};
+function render(snap) {
+  const ok = snap.cluster_healthy;
+  $("conn-dot").className = "dot " + (ok ? "ok" : "warn");
+  $("conn-text").textContent = ok ? "Cluster healthy" : "Degraded";
+  $("clock").textContent = new Date(snap.ts * 1000).toLocaleTimeString();
+  $("logs-btn").disabled = !(snap.recipe && snap.recipe.running);
+
+  // generation throughput (tokens/sec) from the cumulative counter
+  const gen = snap.vllm && snap.vllm.metrics && snap.vllm.metrics["vllm:generation_tokens_total"];
+  if (gen != null) {
+    if (_lastGen != null && snap.ts > _lastTs) push("tokps", Math.max(0, (gen - _lastGen) / (snap.ts - _lastTs)));
+    _lastGen = gen; _lastTs = snap.ts;
+  }
+
+  // health-change notifications
+  const healthy = !!snap.cluster_healthy;
+  if (_prevHealthy != null && _prevHealthy !== healthy) {
+    notify(healthy ? "Cluster healthy" : "Cluster degraded",
+           healthy ? "vLLM and all nodes are back." : "A node or vLLM went unhealthy.");
+  }
+  _prevHealthy = healthy;
+  (snap.nodes || []).forEach(n => {
+    if (_prevOnline[n.name] === true && !n.online) notify("Node offline", n.name + " stopped reporting.");
+    _prevOnline[n.name] = n.online;
+  });
+
+  renderRecipe(snap.recipe);
+  renderRay(snap.ray, snap.vllm);
+  renderVllm(snap.vllm);
+  renderNodes(snap.nodes);
+}
+
+// -- WebSocket with auto-reconnect ---------------------------------------
+let ws, retry = 0;
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => { retry = 0; $("conn-dot").className = "dot ok"; $("conn-text").textContent = "connected"; };
+  ws.onmessage = (e) => { try { render(JSON.parse(e.data)); } catch (_) {} };
+  ws.onclose = () => {
+    $("conn-dot").className = "dot bad"; $("conn-text").textContent = "reconnecting…";
+    retry = Math.min(retry + 1, 6);
+    setTimeout(connect, 500 * retry);
+  };
+  ws.onerror = () => ws.close();
+}
+connect();
+</script>
+</body>
+</html>

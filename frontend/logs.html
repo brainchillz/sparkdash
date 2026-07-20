@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SparkDash · Logs</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  html, body { height: 100%; }
+  body { display: flex; flex-direction: column; }
+  header { flex: none; }
+  .term {
+    flex: 1; overflow-y: auto; margin: 0; padding: 12px 16px;
+    background: #010409; font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+  }
+  .term .ln { color: #c9d1d9; }
+  .term .sys { color: var(--accent); }
+  .term.hide-noise .noise { display: none; }
+  .toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Spark<span class="accent">Dash</span> <span class="meta" style="font-size:13px">logs</span></h1>
+  <div style="display:flex; gap:12px; align-items:center;">
+    <span class="status-pill"><span class="dot" id="dot"></span><span id="state">connecting…</span></span>
+    <label class="toggle" title="Hide the repetitive /health, /metrics and /v1/models access-log lines"><input type="checkbox" id="hidenoise" checked onchange="toggleNoise()"> Hide polling</label>
+    <label class="toggle"><input type="checkbox" id="follow" checked> Auto-scroll</label>
+    <button class="btn" onclick="clearLog()">Clear</button>
+    <button class="btn" onclick="reconnect()">Reconnect</button>
+  </div>
+</header>
+
+<pre class="term" id="term"></pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const term = $("term");
+const MAX_LINES = 6000;
+let ws, retry = 0;
+
+// Access-log lines for polling/status endpoints — the bulk of the noise.
+const NOISE = /"(GET|HEAD|OPTIONS) \/(health|metrics|v1\/models|ping|version|openapi\.json|favicon\.ico)\b/;
+
+function atBottom(){
+  return term.scrollHeight - term.scrollTop - term.clientHeight < 40;
+}
+function append(text, sys){
+  const stick = $("follow").checked;
+  const div = document.createElement("div");
+  div.className = sys ? "sys" : (NOISE.test(text) ? "ln noise" : "ln");
+  div.textContent = text;
+  term.appendChild(div);
+  while (term.childElementCount > MAX_LINES) term.removeChild(term.firstChild);
+  if (stick) term.scrollTop = term.scrollHeight;
+}
+function clearLog(){ term.innerHTML = ""; }
+function toggleNoise(){
+  term.classList.toggle("hide-noise", $("hidenoise").checked);
+  if ($("follow").checked) term.scrollTop = term.scrollHeight;
+}
+
+function setState(txt, cls){ $("state").textContent = txt; $("dot").className = "dot " + (cls||""); }
+
+function connect(){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/api/logs/ws`);
+  ws.onopen = () => { retry = 0; setState("streaming", "ok"); };
+  ws.onmessage = (e) => {
+    append(e.data, e.data.startsWith("[sparkdash]"));
+  };
+  ws.onclose = () => {
+    setState("disconnected — retrying", "bad");
+    retry = Math.min(retry + 1, 6);
+    setTimeout(connect, 800 * retry);
+  };
+  ws.onerror = () => ws.close();
+}
+function reconnect(){ if (ws) ws.close(); clearLog(); connect(); }
+
+// Turn off auto-scroll if the user scrolls up; back on when they reach bottom.
+term.addEventListener("scroll", () => { $("follow").checked = atBottom(); });
+
+toggleNoise();   // apply the default "hide polling" filter
+connect();
+</script>
+</body>
+</html>

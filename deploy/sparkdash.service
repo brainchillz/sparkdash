@@ -1,0 +1,46 @@
+[Unit]
+Description=SparkDash — read-only dashboard for the sparkrun DGX Spark cluster
+Documentation=https://github.com/brainchillz/sparkdash
+# Ray's dashboard is bound to 127.0.0.1 on the head node, and the collectors
+# SSH to both nodes, so the network must be up first. docker is where the
+# sparkrun/vLLM/Ray containers live; wait for it if present (soft dependency).
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+Group=nvidia
+# Canonical install path (see deploy/install.sh). The installer rewrites this
+# path if SPARKDASH_PREFIX is overridden. Not the dev checkout.
+WorkingDirectory=/opt/sparkdash
+
+# HOME is needed so the SSH probe finds ~/.ssh keys/known_hosts; PATH must
+# include ~/.local/bin (sparkrun) and /usr/bin (ssh, nvidia-smi, df, awk).
+Environment=HOME=/home/nvidia
+Environment=PATH=/home/nvidia/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=SPARKDASH_PORT=7862
+
+# `python -m sparkdash` ensures a TLS cert exists, then serves HTTPS. Running
+# the module (not uvicorn directly) is what lets an in-app cert swap restart
+# cleanly: it exits 0 on SIGTERM and systemd brings it back with the new cert.
+ExecStart=/opt/sparkdash/.venv/bin/python -m sparkdash
+
+# Restart=always (not on-failure) so the cert-swap self-restart works — the app
+# exits 0 after installing a new cert and must come back up. A bad cert can't
+# brick access: startup self-heals to a self-signed cert if the configured one
+# won't load. `systemctl stop` is still honoured (explicit stop won't restart).
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+KillSignal=SIGINT
+
+# Light hardening (kept loose: the service legitimately spawns ssh/nvidia-smi).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

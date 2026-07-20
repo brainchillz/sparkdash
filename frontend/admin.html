@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SparkDash · Admin</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <h1>Spark<span class="accent">Dash</span> <span class="meta" style="font-size:13px">admin</span></h1>
+  <div style="display:flex; gap:12px; align-items:center;">
+    <span class="meta" id="whoami"></span>
+    <button class="btn" id="logout-btn" onclick="doLogout()" style="display:none">Log out</button>
+    <a class="btn" href="/">&larr; Dashboard</a>
+  </div>
+</header>
+
+<main class="narrow">
+
+  <!-- Login -->
+  <div id="login-card" class="card" style="max-width:400px; margin:6vh auto 0; display:none">
+    <h2>Sign in</h2>
+    <p class="meta" id="login-hint">Sign in to manage models, API tokens, and the TLS certificate.</p>
+    <label>Username</label>
+    <input id="login-user" autocomplete="username" placeholder="username">
+    <label>Password</label>
+    <input id="login-pass" type="password" autocomplete="current-password"
+           placeholder="password" onkeydown="if(event.key==='Enter')doLogin()">
+    <div class="err" id="login-err"></div>
+    <div class="row" style="margin-top:6px; justify-content:flex-end">
+      <button class="btn primary" id="login-btn" onclick="doLogin()">Sign in</button>
+    </div>
+  </div>
+
+  <!-- Authenticated content -->
+  <div id="admin-content" style="display:none">
+
+    <div class="tabs">
+      <button class="tab" data-tab="recipes" onclick="showTab('recipes')">Recipes</button>
+      <button class="tab" data-tab="models" onclick="showTab('models')">Models</button>
+      <button class="tab" data-tab="chat" onclick="showTab('chat')">Chat</button>
+      <button class="tab" data-tab="settings" onclick="showTab('settings')">Settings</button>
+    </div>
+
+    <div class="tabpanel" id="tab-recipes">
+    <div class="card">
+      <h2>Recipe Control</h2>
+      <div id="ctl-current" class="meta">loading…</div>
+
+      <div id="ctl-start-form" style="margin-top:14px; display:none">
+        <label>Recipe to start</label>
+        <select id="ctl-recipe" onchange="onCtlRecipe()">
+          <option value="">— choose a recipe —</option>
+        </select>
+        <div class="row" style="margin-top:10px; gap:18px">
+          <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer">
+            <input type="radio" name="ctlmode" value="solo" id="mode-solo" onchange="onCtlRecipe()"> Single node
+          </label>
+          <label id="mode-cluster-label" style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer">
+            <input type="radio" name="ctlmode" value="cluster" id="mode-cluster" checked onchange="onCtlRecipe()"> Cluster
+          </label>
+        </div>
+        <div class="meta" id="ctl-preflight" style="margin-top:8px"></div>
+        <div class="err" id="ctl-err"></div>
+        <div class="row" style="margin-top:6px; justify-content:flex-end">
+          <button class="btn primary" id="ctl-start" onclick="ctlStart()">Start</button>
+        </div>
+      </div>
+
+      <div id="ctl-op" style="display:none; margin-top:14px">
+        <div class="row" style="justify-content:space-between">
+          <span><b id="op-action"></b> <span class="meta" id="op-phase"></span></span>
+        </div>
+        <div id="op-msg" class="meta" style="margin:4px 0"></div>
+        <pre id="op-output" style="max-height:240px; overflow:auto; background:#010409; margin:0; padding:10px; border-radius:7px; font-family:ui-monospace,monospace; font-size:11px; white-space:pre-wrap; color:#c9d1d9"></pre>
+      </div>
+    </div>
+    </div><!-- /tab-recipes -->
+
+    <div class="tabpanel" id="tab-models">
+    <div class="card">
+      <h2>Models &mdash; Preload &amp; Cache</h2>
+      <label>Recipe (fills the model below)</label>
+      <select id="recipe-select" onchange="onRecipePick()">
+        <option value="">— choose a recipe —</option>
+      </select>
+      <label>HuggingFace model</label>
+      <input id="preload-model" placeholder="e.g. nvidia/MiniMax-M2.7-NVFP4 or org/repo:Q8_0">
+      <div class="row" style="margin-top:10px; justify-content:space-between">
+        <label id="mirror-label" style="margin:0; display:flex; align-items:center; gap:7px; cursor:pointer">
+          <input type="checkbox" id="preload-mirror" checked style="width:auto">
+          Mirror to cluster over RDMA
+        </label>
+        <button class="btn primary" id="preload-btn" onclick="startPreload()">Preload</button>
+      </div>
+      <div class="err" id="preload-err"></div>
+
+      <div id="preload-job" style="display:none; margin-top:14px">
+        <div class="row" style="justify-content:space-between">
+          <span><b id="job-phase"></b> <span class="meta" id="job-model"></span></span>
+          <button class="btn danger" id="job-cancel" onclick="cancelPreload()">Cancel</button>
+        </div>
+        <div id="job-bars"></div>
+        <div class="meta" id="job-msg" style="margin-top:4px"></div>
+      </div>
+
+      <div id="cache-list" style="margin-top:16px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Backup &amp; Restore</h2>
+      <p class="meta">Save a cached model to a shared location so a 150&nbsp;GB+
+        download never has to be repeated. Backups are stored, one copy per
+        model, under <code>&lt;target&gt;/Sparkdash/Models/</code>.</p>
+      <label>Backup target (base path)</label>
+      <div class="row" style="gap:8px">
+        <input id="backup-base" placeholder="/mnt/llm" style="flex:1">
+        <button class="btn" id="backup-base-save" onclick="saveBackupTarget()">Save</button>
+      </div>
+      <div class="meta" id="backup-base-info" style="margin-top:4px"></div>
+      <div class="err" id="backup-err"></div>
+
+      <div id="backup-job" style="display:none; margin-top:14px">
+        <div class="row" style="justify-content:space-between">
+          <span><b id="bjob-phase"></b> <span class="meta" id="bjob-model"></span></span>
+          <button class="btn danger" id="bjob-cancel" onclick="cancelBackup()">Cancel</button>
+        </div>
+        <div id="bjob-bar"></div>
+        <div class="meta" id="bjob-msg" style="margin-top:4px"></div>
+      </div>
+
+      <div id="backup-list" style="margin-top:16px"></div>
+    </div>
+    </div><!-- /tab-models -->
+
+    <div class="tabpanel" id="tab-chat">
+    <div class="card">
+      <h2>Chat &mdash; test the running model</h2>
+      <div id="chat-model" class="meta" style="margin-bottom:10px">…</div>
+      <div id="chat-log" style="height:340px; overflow-y:auto; background:#010409; border:1px solid var(--border); border-radius:8px; padding:12px; display:flex; flex-direction:column; gap:10px"></div>
+      <div class="err" id="chat-err"></div>
+      <div class="row" style="margin-top:10px; align-items:flex-end; gap:8px">
+        <textarea id="chat-input" rows="2" placeholder="Ask the model something…  (Enter to send, Shift+Enter for newline)" style="flex:1" onkeydown="chatKey(event)"></textarea>
+        <button class="btn primary" id="chat-send" onclick="chatSend()">Send</button>
+      </div>
+      <div class="row" style="margin-top:8px; gap:16px; align-items:center; flex-wrap:wrap">
+        <label class="meta" style="margin:0; display:inline-flex; align-items:center; gap:6px">temp
+          <input id="chat-temp" type="number" min="0" max="2" step="0.1" value="0.7" style="width:70px"></label>
+        <label class="meta" style="margin:0; display:inline-flex; align-items:center; gap:6px">max tokens
+          <input id="chat-maxtok" type="number" min="1" step="128" value="1024" style="width:90px"></label>
+        <button class="btn" onclick="chatClear()">Clear</button>
+        <button class="btn danger" id="chat-stop" onclick="chatStop()" style="display:none">Stop</button>
+      </div>
+    </div>
+    </div><!-- /tab-chat -->
+
+    <div class="tabpanel" id="tab-settings">
+    <div class="card">
+      <h2>API Tokens</h2>
+      <p class="meta">For programmatic access to write actions. Shown once when created.</p>
+      <div class="row">
+        <input id="tok-name" placeholder="token name (e.g. ci-runner)">
+        <button class="btn primary" onclick="createToken()">Generate</button>
+      </div>
+      <div class="secret" id="tok-secret" style="display:none"></div>
+      <div class="err" id="tok-err"></div>
+      <div class="tok-list" id="tok-list" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h2>TLS Certificate</h2>
+      <div class="certinfo" id="cert-info">loading…</div>
+      <label>Replace certificate (PEM)</label>
+      <textarea id="cert-pem" rows="4" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+      <label>Private key (PEM)</label>
+      <textarea id="cert-key" rows="4" placeholder="-----BEGIN PRIVATE KEY-----"></textarea>
+      <div class="err" id="cert-err"></div>
+      <div class="row" style="margin-top:8px; justify-content:space-between">
+        <span class="meta">Applying restarts the server (~2s).</span>
+        <button class="btn primary" onclick="replaceCert()">Install &amp; restart</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Notifications</h2>
+      <p class="meta">Browser notifications when a recipe finishes starting or fails, a preload completes, or cluster health changes.</p>
+      <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; margin:0">
+        <input type="checkbox" id="notif-toggle" onchange="toggleNotifications()" style="width:auto"> Enable notifications
+      </label>
+      <div class="meta" id="notif-status" style="margin-top:8px"></div>
+    </div>
+    </div><!-- /tab-settings -->
+
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const api = (path, opts={}) => fetch(path, {credentials:"same-origin", ...opts})
+  .then(async r => { const b = await r.json().catch(()=>({})); if(!r.ok) throw new Error(b.detail||r.statusText); return b; });
+
+function fmtBytes(b) {
+  if (b == null) return "—";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (b >= 1024 && i < u.length-1) { b /= 1024; i++; }
+  return b.toFixed(b < 10 && i > 0 ? 1 : 0) + " " + u[i];
+}
+
+// -- session state -------------------------------------------------------
+function showLogin(me) {
+  $("admin-content").style.display = "none";
+  $("login-card").style.display = "";
+  $("logout-btn").style.display = "none";
+  $("whoami").textContent = "";
+  $("login-err").textContent = "";
+  $("login-pass").value = "";
+  if (me && me.admin_configured === false) {
+    $("login-hint").innerHTML = `No admin configured yet. Set one on the host:<br>` +
+      `<code>python -m sparkdash.admin set-password</code>`;
+  }
+  setTimeout(()=>$("login-user").focus(), 50);
+}
+function showContent(user) {
+  $("login-card").style.display = "none";
+  $("admin-content").style.display = "";
+  $("logout-btn").style.display = "";
+  $("whoami").textContent = "signed in as " + user;
+  initNotifications();
+  applyTopology().then(() => {
+    // Background pollers run regardless of the active tab (so notifications fire).
+    pollOp(); pollJob(); pollBackupJob();
+    const want = (location.hash || "").replace("#", "");
+    showTab(["recipes","models","chat","settings"].includes(want) ? want : "recipes");
+  });
+}
+
+const TAB_LOADERS = {
+  recipes: loadRecipeControl,
+  models: () => { loadRecipes(); loadCache(); loadBackupTarget(); loadBackups(); },
+  chat: initChat,
+  settings: () => { loadTokens(); loadCert(); },
+};
+function showTab(name){
+  document.querySelectorAll(".tabpanel").forEach(p => p.classList.remove("active"));
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+  const panel = $("tab-"+name); if (panel) panel.classList.add("active");
+  try { history.replaceState(null, "", "#"+name); } catch(_) { location.hash = name; }
+  const load = TAB_LOADERS[name]; if (load) load();
+}
+
+// True for recipes this deployment can actually run (single node hides
+// cluster-only recipes, which need >= 2 nodes).
+function runnableHere(r){ return nodeCount > 1 || (r.min_nodes || 1) < 2; }
+
+// Single-node deployments: hide cluster/mirror affordances that need >1 node.
+let nodeCount = 2;
+async function applyTopology(){
+  try { nodeCount = (await api("/api/snapshot")).node_count || 1; } catch(_){ nodeCount = 1; }
+  const single = nodeCount <= 1;
+  const ml = $("mirror-label"); if (ml) ml.style.display = single ? "none" : "";
+  if (single && $("preload-mirror")) $("preload-mirror").checked = false;
+  const cl = $("mode-cluster-label"); if (cl) cl.style.display = single ? "none" : "";
+  if (single){ const s = $("mode-solo"); if (s) s.checked = true; }
+}
+
+// -- recipe control ------------------------------------------------------
+let opTimer = null, ctlRecipes = [], lastOpActive = false;
+
+async function loadRecipeControl(){
+  if (!ctlRecipes.length) {
+    try { ctlRecipes = (await api("/api/admin/recipes")).recipes; } catch(_){}
+  }
+  // Rebuild the dropdown each time: registry recipes + saved custom recipes
+  // (the saved set grows as you stop non-registry recipes).
+  let saved = [];
+  try { saved = (await api("/api/admin/recipe/saved")).recipes; } catch(_){}
+  const sel = $("ctl-recipe");
+  sel.length = 1;   // keep the placeholder
+  ctlRecipes.slice().filter(runnableHere).sort((a,b)=>a.name.localeCompare(b.name)).forEach(r => {
+    const o = document.createElement("option");
+    o.value = r.name;
+    o.dataset.minNodes = r.min_nodes || 1;
+    o.textContent = `${r.name}  ·  ${r.min_nodes>1?"cluster only":"single or cluster"}` + (r.tp?`  (tp=${r.tp})`:"");
+    sel.appendChild(o);
+  });
+  saved.forEach(r => {
+    const o = document.createElement("option");
+    o.value = r.path;              // a file path re-runnable via `sparkrun run`
+    o.dataset.minNodes = 1;        // saved recipes can run solo or cluster
+    o.textContent = `${r.name}  ·  ${r.model||"custom"}  ·  saved`;
+    sel.appendChild(o);
+  });
+  let rec;
+  try { rec = await api("/api/admin/recipe/current"); } catch(_){ rec = {}; }
+  const cur = $("ctl-current"), form = $("ctl-start-form");
+  if (rec.running) {
+    cur.innerHTML = `Running: <b>${rec.name}</b> <span class="meta">(${rec.mode||"?"})</span>
+      <div class="row" style="margin-top:10px">
+        <button class="btn danger" onclick="ctlStop()">Stop</button>
+        <button class="btn" onclick="ctlRestart()">Restart</button>
+      </div>`;
+    form.style.display = "none";   // must stop first
+  } else {
+    let last = {};
+    try { last = await api("/api/admin/recipe/last"); } catch(_){}
+    window._lastRecipe = last;
+    let html = `<span class="meta">No recipe running.</span>`;
+    if (last && last.name){
+      const m = nodeCount <= 1 ? "solo" : (last.mode || "cluster");
+      html += `<div class="row" style="margin-top:10px">
+        <button class="btn primary" onclick="ctlStartLast()">Start last: ${last.name} (${m})</button>
+        <span class="meta">last stopped recipe</span></div>`;
+    }
+    cur.innerHTML = html;
+    form.style.display = "";
+    onCtlRecipe();
+  }
+  pollOp();
+}
+
+async function ctlStartLast(){
+  const last = window._lastRecipe || {};
+  if (!last.path) return;
+  const mode = nodeCount <= 1 ? "solo" : (last.mode || "cluster");
+  if (!confirm(`Start ${last.name} in ${mode} mode?`)) return;
+  try {
+    await api("/api/admin/recipe/start", {method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({recipe: last.path, mode})});
+    pollOp(true);
+  } catch(e){ alert(e.message); }
+}
+
+function onCtlRecipe(){
+  const opt = $("ctl-recipe").selectedOptions[0];
+  const minNodes = opt ? parseInt(opt.dataset.minNodes || "1") : 1;
+  if (nodeCount <= 1){
+    $("mode-solo").checked = true;      // only solo is possible on one node
+    $("mode-solo").disabled = false;
+  } else {
+    // min_nodes >= 2 forces cluster; solo only allowed for single-node recipes.
+    $("mode-solo").disabled = minNodes >= 2;
+    if (minNodes >= 2) $("mode-cluster").checked = true;
+  }
+  $("ctl-preflight").textContent = "";
+  $("ctl-err").textContent = "";
+  if (opt && opt.value) runPreflight();
+}
+
+async function runPreflight(){
+  const recipe = $("ctl-recipe").value;
+  const mode = document.querySelector('input[name=ctlmode]:checked').value;
+  if (!recipe) return;
+  $("ctl-preflight").textContent = "checking fit…";
+  try {
+    const p = await api("/api/admin/recipe/preflight", {method:"POST",
+      headers:{"content-type":"application/json"}, body: JSON.stringify({recipe, mode})});
+    if (!p.ok) { $("ctl-preflight").innerHTML = `<span class="err">${p.error||"recipe check failed"}</span>`; return; }
+    const fitBadge = p.fit === "YES" ? `<span class="badge custom">fits</span>` : `<span class="badge ss">${p.fit||"?"}</span>`;
+    $("ctl-preflight").innerHTML = `${fitBadge} mode ${p.mode||mode} · weights ${p.weights||"?"}` +
+      (p.per_gpu?` · ${p.per_gpu}/GPU`:"") + (p.context_mult?` · ctx ${p.context_mult}`:"");
+  } catch(e){ $("ctl-preflight").innerHTML = `<span class="err">${e.message}</span>`; }
+}
+
+async function ctlStart(){
+  const recipe = $("ctl-recipe").value;
+  const mode = document.querySelector('input[name=ctlmode]:checked').value;
+  $("ctl-err").textContent = "";
+  if (!recipe){ $("ctl-err").textContent = "Choose a recipe."; return; }
+  if (!confirm(`Start ${recipe} in ${mode} mode?`)) return;
+  try {
+    await api("/api/admin/recipe/start", {method:"POST",
+      headers:{"content-type":"application/json"}, body: JSON.stringify({recipe, mode})});
+    pollOp(true);
+  } catch(e){ $("ctl-err").textContent = e.message; }
+}
+async function ctlStop(){
+  if (!confirm("Stop the running recipe? This tears down the live model.")) return;
+  try { await api("/api/admin/recipe/stop", {method:"POST"}); pollOp(true); }
+  catch(e){ alert(e.message); }
+}
+async function ctlRestart(){
+  if (!confirm("Restart the running recipe? It will be briefly unavailable.")) return;
+  try { await api("/api/admin/recipe/restart", {method:"POST",
+    headers:{"content-type":"application/json"}, body: JSON.stringify({})}); pollOp(true); }
+  catch(e){ alert(e.message); }
+}
+
+async function pollOp(force){
+  clearTimeout(opTimer);
+  let op;
+  try { op = await api("/api/admin/recipe/op"); } catch(_){ return; }
+  const box = $("ctl-op");
+  if (op.phase === "idle"){ box.style.display = "none"; lastOpActive = false; return; }
+  box.style.display = "";
+  $("op-action").textContent = (op.action||"").toUpperCase();
+  $("op-phase").textContent = op.phase || "";
+  $("op-msg").textContent = op.error ? op.error : (op.message || "");
+  $("op-msg").className = op.error ? "err" : "meta";
+  const out = $("op-output");
+  const stick = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+  out.textContent = (op.output || []).join("\n");
+  if (stick) out.scrollTop = out.scrollHeight;
+  if (op.active){
+    lastOpActive = true;
+    opTimer = setTimeout(()=>pollOp(), 1500);
+  } else if (lastOpActive){
+    // just finished — notify + refresh current state once (avoids a poll↔reload loop)
+    lastOpActive = false;
+    notify(op.phase === "done" ? "Recipe ready" : "Recipe op failed",
+           `${(op.action||"").toUpperCase()}: ${op.error || op.message || ""}`);
+    loadRecipeControl();
+  }
+}
+
+async function doLogin(){
+  $("login-err").textContent = "";
+  try {
+    const r = await api("/api/auth/login", {method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({username:$("login-user").value, password:$("login-pass").value})});
+    showContent(r.username);
+  } catch(e){ $("login-err").textContent = e.message; }
+}
+async function doLogout(){
+  await api("/api/auth/logout", {method:"POST"}).catch(()=>{});
+  showLogin();
+}
+
+// -- models: preload & cache --------------------------------------------
+let jobTimer = null, lastJobActive = false;
+
+async function loadRecipes(){
+  try {
+    const {recipes} = await api("/api/admin/recipes");
+    const sel = $("recipe-select");
+    sel.length = 1;
+    recipes.filter(runnableHere).sort((a,b)=>a.name.localeCompare(b.name)).forEach(r => {
+      const o = document.createElement("option");
+      o.value = r.model;
+      o.textContent = `${r.name}  ·  ${r.model}` + (r.min_nodes>1?`  (${r.min_nodes} nodes)`:"");
+      sel.appendChild(o);
+    });
+  } catch(_){}
+}
+function onRecipePick(){
+  const v = $("recipe-select").value;
+  if(v) $("preload-model").value = v;
+}
+
+async function loadCache(){
+  try {
+    let running = null;
+    try { const s = await api("/api/snapshot"); running = s.vllm && s.vllm.model; } catch(_){}
+    const c = await api("/api/admin/cache");
+    const nodes = c.nodes;
+    $("cache-list").innerHTML = `<div class="meta" style="margin-bottom:6px">Cached models</div>` +
+      (c.models.length ? c.models.map(m => {
+        const vals = nodes.map(n => m.sizes[n] || 0);
+        const maxSize = Math.max(...vals, 0);
+        // Under-replicated: present somewhere but missing/partial on another node.
+        const underRep = nodeCount > 1 && maxSize > 0 && vals.some(v => v < maxSize * 0.95);
+        const sizes = nodes.map(n => `${n}: ${m.sizes[n]?fmtBytes(m.sizes[n]):"—"}`).join(" · ");
+        let action = `<button class="btn" onclick="startBackup('${m.repo}')">Backup</button> `;
+        if (underRep) action += `<button class="btn" onclick="mirrorCachedModel('${m.repo}')">Mirror</button> `;
+        action += (running && m.repo === running)
+          ? `<span class="badge custom">loaded</span>`
+          : `<button class="btn danger" onclick="deleteCachedModel('${m.repo}')">Delete</button>`;
+        return `<div class="tok"><div><div class="name" style="font-size:13px">${m.repo}</div>
+          <div class="sub">${sizes}${underRep?' · <span style="color:var(--warn)">not on all nodes</span>':''}</div></div>
+          <div class="row" style="gap:6px">${action}</div></div>`;
+      }).join("") : `<span class="meta">No models cached.</span>`);
+  } catch(e){ $("cache-list").innerHTML = `<span class="err">${e.message}</span>`; }
+}
+
+async function startPreload(){
+  $("preload-err").textContent = "";
+  const model = $("preload-model").value.trim();
+  if(!model){ $("preload-err").textContent = "Enter a model id (or pick a recipe)."; return; }
+  try {
+    await api("/api/admin/preload", {method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({model, mirror: $("preload-mirror").checked})});
+    pollJob(true);
+  } catch(e){ $("preload-err").textContent = e.message; }
+}
+async function cancelPreload(){
+  await api("/api/admin/preload/cancel", {method:"POST"}).catch(()=>{});
+}
+
+function bar2(done, total){
+  const pct = total ? Math.min(100, done/total*100) : 0;
+  return `<div class="bar" style="margin:4px 0"><span style="width:${pct}%"></span></div>`;
+}
+async function pollJob(force){
+  clearTimeout(jobTimer);
+  let s;
+  try { s = await api("/api/admin/preload/status"); } catch(_){ return; }
+  const box = $("preload-job");
+  if(s.phase === "idle" && !force){ box.style.display="none"; return; }
+  if(s.phase === "idle"){ box.style.display="none"; return; }
+  box.style.display = "";
+  const phases = {resolving:"Resolving…", downloading:"Downloading", mirroring:"Mirroring", done:"Done", error:"Error", cancelled:"Cancelled"};
+  $("job-phase").textContent = phases[s.phase] || s.phase;
+  $("job-model").textContent = s.model || "";
+  $("job-cancel").style.display = s.active ? "" : "none";
+  $("job-msg").textContent = s.error ? s.error : (s.message || "");
+  $("job-msg").className = s.error ? "err" : "meta";
+  let bars = `<div class="stat" style="margin:8px 0 2px"><div class="top-line"><span>head (download)</span>`+
+    `<span class="sub">${fmtBytes(s.head_bytes||0)} / ${fmtBytes(s.total_bytes||0)}</span></div>${bar2(s.head_bytes,s.total_bytes)}</div>`;
+  for(const [name, done] of Object.entries(s.workers||{})){
+    bars += `<div class="stat" style="margin:8px 0 2px"><div class="top-line"><span>${name} (mirror)</span>`+
+      `<span class="sub">${fmtBytes(done)} / ${fmtBytes(s.total_bytes||0)}</span></div>${bar2(done,s.total_bytes)}</div>`;
+  }
+  $("job-bars").innerHTML = bars;
+  if(s.active){ lastJobActive = true; jobTimer = setTimeout(()=>pollJob(), 1500); }
+  else {
+    if (lastJobActive){
+      lastJobActive = false;
+      notify(s.phase === "done" ? "Preload complete" : "Preload " + s.phase, s.model || "");
+    }
+    loadCache();   // refresh cache list when a job finishes
+  }
+}
+
+// -- model backup & restore ----------------------------------------------
+let backupTimer = null, lastBackupActive = false;
+
+async function loadBackupTarget(){
+  try {
+    const {base} = await api("/api/admin/backup/target");
+    if (document.activeElement !== $("backup-base")) $("backup-base").value = base || "";
+  } catch(_){}
+}
+async function saveBackupTarget(){
+  $("backup-err").textContent = "";
+  const base = $("backup-base").value.trim();
+  try {
+    await api("/api/admin/backup/target", {method:"POST",
+      headers:{"content-type":"application/json"}, body: JSON.stringify({base})});
+    loadBackups();
+  } catch(e){ $("backup-err").textContent = e.message; }
+}
+
+async function loadBackups(){
+  const base = $("backup-base").value.trim();
+  try {
+    const q = base ? `?base=${encodeURIComponent(base)}` : "";
+    const r = await api("/api/admin/backups" + q);
+    const disk = r.disk ? ` · ${fmtBytes(r.disk.free)} free of ${fmtBytes(r.disk.total)}` : "";
+    $("backup-base-info").innerHTML = (r.exists
+      ? `Backups in <code>${r.root}</code>` + (r.writable ? "" : ` · <span style="color:var(--warn)">not writable</span>`)
+      : `<span style="color:var(--warn)">${r.root} does not exist yet — it will be created on first backup.</span>`) + disk;
+    $("backup-list").innerHTML =
+      `<div class="meta" style="margin-bottom:6px">Available backups</div>` +
+      (r.backups.length ? r.backups.map(b => {
+        const rec = (b.recipes && b.recipes.length)
+          ? ` · recipe: ${b.recipes.map(esc).join(", ")}` : "";
+        const when = b.saved_at ? ` · ${new Date(b.saved_at*1000).toLocaleDateString()}` : "";
+        const badge = b.cached ? ` <span class="badge custom">cached</span>` : "";
+        return `<div class="tok"><div><div class="name" style="font-size:13px">${esc(b.repo)}${badge}</div>
+          <div class="sub">${fmtBytes(b.size||0)}${rec}${when}</div></div>
+          <div class="row" style="gap:6px">
+            <button class="btn" onclick="startRestore('${b.repo}')">Restore</button>
+            <button class="btn" onclick="startVerify('${b.repo}')">Verify</button>
+            <button class="btn danger" onclick="deleteBackup('${b.repo}')">Delete</button></div></div>`;
+      }).join("") : `<span class="meta">No backups at this location.</span>`);
+  } catch(e){ $("backup-list").innerHTML = `<span class="err">${e.message}</span>`; }
+}
+
+async function startBackup(repo){
+  $("backup-err").textContent = "";
+  const base = $("backup-base").value.trim();
+  if(!base){ $("backup-err").textContent = "Set a backup target first."; return; }
+  try {
+    await api("/api/admin/backup", {method:"POST",
+      headers:{"content-type":"application/json"}, body: JSON.stringify({repo, base})});
+    pollBackupJob(true);
+  } catch(e){ $("backup-err").textContent = e.message; }
+}
+async function startRestore(repo){
+  $("backup-err").textContent = "";
+  const base = $("backup-base").value.trim();
+  const mirror = nodeCount > 1;
+  if (!confirm(`Restore "${repo}" from backup` + (mirror ? " and mirror to the cluster?" : "?"))) return;
+  try {
+    await api("/api/admin/restore", {method:"POST",
+      headers:{"content-type":"application/json"}, body: JSON.stringify({repo, base, mirror})});
+    pollBackupJob(true);
+  } catch(e){ $("backup-err").textContent = e.message; }
+}
+async function cancelBackup(){
+  await api("/api/admin/backup/cancel", {method:"POST"}).catch(()=>{});
+}
+async function startVerify(repo){
+  $("backup-err").textContent = "";
+  const base = $("backup-base").value.trim();
+  try {
+    await api("/api/admin/backup/verify", {method:"POST",
+      headers:{"content-type":"application/json"}, body: JSON.stringify({repo, base})});
+    pollBackupJob(true);
+  } catch(e){ $("backup-err").textContent = e.message; }
+}
+async function deleteBackup(repo){
+  if (!confirm(`Delete the backup of "${repo}" from the share? The cached copies on the nodes are not touched.`)) return;
+  $("backup-err").textContent = "";
+  const base = $("backup-base").value.trim();
+  try {
+    await api("/api/admin/backup/delete", {method:"POST",
+      headers:{"content-type":"application/json"}, body: JSON.stringify({repo, base})});
+    loadBackups();
+  } catch(e){ $("backup-err").textContent = e.message; }
+}
+
+async function pollBackupJob(force){
+  clearTimeout(backupTimer);
+  let s;
+  try { s = await api("/api/admin/backup/status"); } catch(_){ return; }
+  const box = $("backup-job");
+  if(s.phase === "idle" && !force){ box.style.display="none"; return; }
+  if(s.phase === "idle"){ box.style.display="none"; return; }
+  box.style.display = "";
+  const verb = {restore:"Restore", verify:"Verify"}[s.op] || "Backup";
+  const phases = {preparing:"Preparing…", copying:`${verb}: copying`, verifying:"Verifying", done:"Done", error:"Error", cancelled:"Cancelled"};
+  $("bjob-phase").textContent = phases[s.phase] || s.phase;
+  $("bjob-model").textContent = s.model || "";
+  $("bjob-cancel").style.display = s.active ? "" : "none";
+  $("bjob-msg").textContent = s.error ? s.error : (s.message || "");
+  $("bjob-msg").className = s.error ? "err" : "meta";
+  $("bjob-bar").innerHTML = s.total_bytes ?
+    `<div class="stat" style="margin:8px 0 2px"><div class="top-line"><span>${verb}</span>`+
+    `<span class="sub">${fmtBytes(s.done_bytes||0)} / ${fmtBytes(s.total_bytes||0)}</span></div>`+
+    bar2(s.done_bytes, s.total_bytes)+`</div>` : "";
+  if(s.active){ lastBackupActive = true; backupTimer = setTimeout(()=>pollBackupJob(), 1500); }
+  else {
+    if (lastBackupActive){
+      lastBackupActive = false;
+      notify(s.phase === "done" ? `${verb} complete` : `${verb} ${s.phase}`, s.model || "");
+    }
+    loadCache(); loadBackups();
+    // A restore hands off to the mirror (preload) job — surface its progress.
+    if (s.mirroring) pollJob(true);
+  }
+}
+
+function esc(t){ const d = document.createElement("div"); d.textContent = t; return d.innerHTML; }
+
+// -- tokens --------------------------------------------------------------
+async function loadTokens(){
+  try {
+    const {tokens} = await api("/api/admin/tokens");
+    $("tok-list").innerHTML = tokens.length ? tokens.map(t => `
+      <div class="tok ${t.revoked?'revoked':''}">
+        <div><div class="name">${t.name}</div>
+          <div class="sub">created ${new Date(t.created*1000).toLocaleDateString()} ·
+            ${t.last_used ? "used "+new Date(t.last_used*1000).toLocaleString() : "never used"}
+            ${t.revoked?" · revoked":""}</div></div>
+        ${t.revoked?"":`<button class="btn danger" onclick="revokeToken('${t.id}')">Revoke</button>`}
+      </div>`).join("") : `<span class="meta">No tokens yet.</span>`;
+  } catch(e){ $("tok-list").innerHTML = `<span class="err">${e.message}</span>`; }
+}
+async function createToken(){
+  $("tok-err").textContent = ""; $("tok-secret").style.display = "none";
+  const name = $("tok-name").value.trim();
+  if(!name){ $("tok-err").textContent = "Enter a token name."; return; }
+  try {
+    const r = await api("/api/admin/tokens", {method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({name})});
+    $("tok-name").value = "";
+    const s = $("tok-secret");
+    s.style.display = ""; s.textContent = r.token + "  (copy now — it won't be shown again)";
+    loadTokens();
+  } catch(e){ $("tok-err").textContent = e.message; }
+}
+async function revokeToken(id){
+  await api("/api/admin/tokens/"+id, {method:"DELETE"}).catch(e=>$("tok-err").textContent=e.message);
+  loadTokens();
+}
+
+// -- cert ----------------------------------------------------------------
+async function loadCert(){
+  try {
+    const c = await api("/api/admin/cert");
+    if(!c.present){ $("cert-info").innerHTML = `<span class="meta">No certificate present.</span>`; return; }
+    const badge = c.self_signed ? `<span class="badge ss">self-signed</span>` : `<span class="badge custom">custom CA</span>`;
+    $("cert-info").innerHTML = `
+      <div class="kv"><span class="k">Status</span><span class="v">${badge}</span></div>
+      <div class="kv"><span class="k">Subject</span><span class="v">${c.subject}</span></div>
+      <div class="kv"><span class="k">Issuer</span><span class="v">${c.issuer}</span></div>
+      <div class="kv"><span class="k">Valid until</span><span class="v">${new Date(c.not_after).toLocaleString()}</span></div>
+      <div class="kv"><span class="k">SANs</span><span class="v">${(c.sans||[]).join(", ")}</span></div>
+      <div class="mono">SHA-256 ${c.fingerprint_sha256}</div>`;
+  } catch(e){ $("cert-info").innerHTML = `<span class="err">${e.message}</span>`; }
+}
+async function replaceCert(){
+  $("cert-err").textContent = "";
+  const cert = $("cert-pem").value.trim(), key = $("cert-key").value.trim();
+  if(!cert || !key){ $("cert-err").textContent = "Paste both the certificate and the key."; return; }
+  if(!confirm("Install this certificate and restart the server?")) return;
+  try {
+    await api("/api/admin/cert", {method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({cert, key})});
+    $("cert-info").innerHTML = `<span class="ok-msg">Certificate installed — restarting… this page will reconnect.</span>`;
+    $("cert-pem").value = ""; $("cert-key").value = "";
+  } catch(e){ $("cert-err").textContent = e.message; }
+}
+
+// -- chat playground -----------------------------------------------------
+let chatMessages = [], chatAbort = null;
+async function initChat(){
+  let model = null, healthy = false;
+  try { const s = await api("/api/snapshot"); model = s.vllm && s.vllm.model; healthy = s.vllm && s.vllm.healthy; } catch(_){}
+  $("chat-model").innerHTML = (healthy && model)
+    ? `Talking to <b>${model}</b>` : `<span class="err">No healthy model — start a recipe first.</span>`;
+  $("chat-send").disabled = !(healthy && model);
+}
+function chatKey(e){ if (e.key === "Enter" && !e.shiftKey){ e.preventDefault(); chatSend(); } }
+function chatClear(){ chatMessages = []; $("chat-log").innerHTML = ""; $("chat-err").textContent = ""; }
+function chatStop(){ if (chatAbort) chatAbort.abort(); }
+function scrollChat(){ const l = $("chat-log"); l.scrollTop = l.scrollHeight; }
+function appendMsg(role, text){
+  const d = document.createElement("div"); d.className = "msg " + role; d.textContent = text;
+  $("chat-log").appendChild(d); scrollChat(); return d;
+}
+// Assistant bubble with a collapsible "thinking" section + an answer section.
+function appendAssistant(){
+  const d = document.createElement("div"); d.className = "msg assistant pending";
+  const think = document.createElement("details"); think.className = "think"; think.style.display = "none";
+  think.innerHTML = `<summary>thinking</summary><div class="think-body"></div>`;
+  const content = document.createElement("div"); content.className = "content";
+  d.append(think, content);
+  $("chat-log").appendChild(d); scrollChat();
+  return {bubble: d, think, thinkBody: think.querySelector(".think-body"), content};
+}
+async function chatSend(){
+  const input = $("chat-input"); const text = input.value.trim();
+  if (!text) return;
+  $("chat-err").textContent = "";
+  appendMsg("user", text); input.value = "";
+  chatMessages.push({role:"user", content:text});
+  const a = appendAssistant();
+  const body = {messages: chatMessages,
+                temperature: parseFloat($("chat-temp").value),
+                max_tokens: parseInt($("chat-maxtok").value)};
+  chatAbort = new AbortController();
+  $("chat-send").disabled = true; $("chat-stop").style.display = "";
+  let answer = "", reasoning = "", buf = "";
+  const handle = (obj) => {
+    if (obj.r != null){ reasoning += obj.r; a.think.style.display = ""; a.thinkBody.textContent = reasoning; }
+    if (obj.c != null){ answer += obj.c; a.content.textContent = answer; }
+    scrollChat();
+  };
+  try {
+    const resp = await fetch("/api/admin/chat", {method:"POST", credentials:"same-origin",
+      headers:{"content-type":"application/json"}, body: JSON.stringify(body), signal: chatAbort.signal});
+    if (!resp.ok){ const e = await resp.json().catch(()=>({})); throw new Error(e.detail || resp.statusText); }
+    const reader = resp.body.getReader(); const dec = new TextDecoder();
+    while (true){
+      const {value, done} = await reader.read(); if (done) break;
+      buf += dec.decode(value, {stream:true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0){
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (line.trim()){ try { handle(JSON.parse(line)); } catch(_){} }
+      }
+    }
+    if (answer) chatMessages.push({role:"assistant", content: answer});
+  } catch(e){
+    if (e.name !== "AbortError") $("chat-err").textContent = e.message;
+    if (answer) chatMessages.push({role:"assistant", content: answer});
+  } finally {
+    a.bubble.classList.remove("pending");
+    if (a.think.style.display !== "none") a.think.open = false;   // collapse thinking when done
+    $("chat-send").disabled = false; $("chat-stop").style.display = "none"; chatAbort = null;
+  }
+}
+
+// -- notifications -------------------------------------------------------
+function initNotifications(){
+  const want = localStorage.getItem("sd-notif") === "1";
+  window._notif = want && ("Notification" in window) && Notification.permission === "granted";
+  const t = $("notif-toggle"); if (t) t.checked = window._notif;
+  updateNotifStatus();
+}
+async function toggleNotifications(){
+  const t = $("notif-toggle");
+  if (t.checked){
+    if (!("Notification" in window)){ t.checked = false; return updateNotifStatus("Not supported in this browser."); }
+    let perm = Notification.permission;
+    if (perm !== "granted") perm = await Notification.requestPermission();
+    if (perm !== "granted"){ t.checked = false; window._notif = false; localStorage.setItem("sd-notif","0"); return updateNotifStatus("Permission denied."); }
+    window._notif = true; localStorage.setItem("sd-notif","1");
+  } else {
+    window._notif = false; localStorage.setItem("sd-notif","0");
+  }
+  updateNotifStatus();
+}
+function updateNotifStatus(msg){
+  const el = $("notif-status"); if (el) el.textContent = msg || (window._notif ? "Enabled." : "Disabled.");
+}
+function notify(title, body){
+  if (window._notif && ("Notification" in window) && Notification.permission === "granted"){
+    try { new Notification(title, {body}); } catch(_){}
+  }
+}
+
+// -- cache prune / mirror ------------------------------------------------
+async function mirrorCachedModel(repo){
+  try {
+    await api("/api/admin/cache/mirror", {method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({repo})});
+    pollJob(true);   // reuse the preload progress panel
+  } catch(e){ alert(e.message); }
+}
+async function deleteCachedModel(repo){
+  if (!confirm(`Delete cached model "${repo}" from all nodes? It can be re-downloaded later.`)) return;
+  try {
+    await api("/api/admin/cache/delete", {method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({repo})});
+    loadCache();
+  } catch(e){ alert(e.message); }
+}
+
+// -- init ----------------------------------------------------------------
+(async function init(){
+  let me;
+  try { me = await api("/api/auth/me"); } catch(_) { me = {authenticated:false}; }
+  if (me.authenticated) showContent(me.username); else showLogin(me);
+})();
+</script>
+</body>
+</html>
