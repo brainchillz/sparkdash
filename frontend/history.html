@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SparkDash · History</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/vendor/uPlot.min.css">
+<style>
+  /* Series colors live in NODE_COLORS below — a categorical pair validated
+     for the dark card surface. Color follows the node, never its position. */
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .controls .btn.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+  @media (max-width: 980px) { .charts { grid-template-columns: 1fr; } }
+  .chart-card h2 { margin-bottom: 4px; }
+  .chart-card .unit { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .u-legend { font-size: 12px; color: var(--muted); }
+  .u-legend .u-value { font-variant-numeric: tabular-nums; color: var(--text); }
+  .u-legend .u-label { color: var(--muted); }
+  .empty-note { margin-top: 24px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Spark<span class="accent">Dash</span> <span class="meta" style="font-size:13px">history</span></h1>
+  <div class="controls">
+    <span id="ranges"></span>
+    <label class="meta" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin:0">
+      <input type="checkbox" id="auto" checked> Auto-refresh
+    </label>
+    <button class="btn" onclick="exportCsv()" title="Download the currently loaded series as CSV">CSV</button>
+    <span class="status-pill"><span class="dot" id="dot"></span><span id="state">loading…</span></span>
+  </div>
+</header>
+
+<main style="max-width:1500px">
+  <div class="charts" id="charts"></div>
+  <div class="empty-note" id="empty" style="display:none">
+    No history yet — samples accumulate every 30s from the moment this feature was deployed.
+  </div>
+</main>
+
+<footer>SparkDash · 30s samples · raw kept 7 days, 5-min min/avg/max rollups kept indefinitely</footer>
+
+<script src="/static/vendor/uPlot.iife.min.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+
+const NODE_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500"]; // fixed slot order
+const CLUSTER_COLOR = "#199e70";
+const RANGES = ["1h", "6h", "24h", "7d", "30d", "1y"];
+const mb2gb = (v) => v == null ? null : v / 1024;
+
+// One chart per metric — every chart has a single unit and a single y-axis.
+const CHARTS = [
+  { key: "gpu_util_pct",   title: "GPU utilization", unit: "%", max: 100 },
+  { key: "cpu_pct",        title: "CPU utilization", unit: "%", max: 100 },
+  { key: "gpu_temp_c",     title: "GPU temperature", unit: "°C" },
+  { key: "cpu_temp_c",     title: "CPU temperature", unit: "°C" },
+  { key: "gpu_power_w",    title: "GPU power", unit: "W" },
+  { key: "mem_used_mb",    title: "RAM used", unit: "GB", map: mb2gb },
+  { key: "vram_used_mb",   title: "VRAM used (per-proc)", unit: "GB", map: mb2gb },
+  { key: "disk_pct",       title: "Storage used", unit: "%", max: 100, derived: true },
+  { key: "tokens_per_sec", title: "Generation throughput", unit: "tok/s", cluster: true },
+  { key: "kv_cache_pct",   title: "KV cache usage", unit: "%", max: 100, cluster: true },
+];
+
+let range = localStorage.getItem("sd-hist-range") || "24h";
+let plots = {};        // key -> uPlot instance
+let lastResp = null;
+
+function renderRangeButtons() {
+  $("ranges").innerHTML = RANGES.map(r =>
+    `<button class="btn ${r === range ? "active" : ""}" onclick="setRange('${r}')">${r}</button>`).join(" ");
+}
+function setRange(r) {
+  range = r;
+  localStorage.setItem("sd-hist-range", r);
+  renderRangeButtons();
+  refresh();
+}
+
+function setState(txt, cls) { $("state").textContent = txt; $("dot").className = "dot " + (cls || ""); }
+
+// -- data shaping ---------------------------------------------------------
+
+function seriesData(chart, resp) {
+  if (chart.cluster) return [resp.cluster_series[chart.key] || []];
+  if (chart.derived && chart.key === "disk_pct") {
+    return resp.nodes.map(n => {
+      const used = resp.node_series.disk_used[n], total = resp.node_series.disk_total[n];
+      return resp.ts.map((_, i) =>
+        used[i] != null && total[i] ? used[i] / total[i] * 100 : null);
+    });
+  }
+  const rows = resp.nodes.map(n => resp.node_series[chart.key][n]);
+  return chart.map ? rows.map(r => r.map(chart.map)) : rows;
+}
+
+function seriesLabels(chart, resp) {
+  return chart.cluster ? ["cluster"] : resp.nodes;
+}
+
+// -- charts ---------------------------------------------------------------
+
+const AXIS_FONT = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+const cursorSync = uPlot.sync("hist");
+
+function chartWidth(el) { return el.clientWidth; } // .plot already sits inside the card padding
+
+function makePlot(chart, resp, el) {
+  const labels = seriesLabels(chart, resp);
+  const fmt = (v) => v == null ? "—" : (Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1)) + " " + chart.unit;
+  const series = [
+    {},
+    ...labels.map((name, i) => ({
+      label: name,
+      stroke: chart.cluster ? CLUSTER_COLOR : NODE_COLORS[i % NODE_COLORS.length],
+      width: 2,
+      spanGaps: false,
+      value: (u, v) => fmt(v),
+    })),
+  ];
+  const opts = {
+    width: chartWidth(el), height: 190,
+    scales: { y: chart.max ? { range: [0, chart.max] } : {} },
+    cursor: { sync: { key: "hist", setSeries: false }, points: { size: 8 } },
+    axes: [
+      { stroke: "#8b949e", font: AXIS_FONT,
+        grid: { stroke: "#21262d", width: 1 }, ticks: { stroke: "#30363d" } },
+      { stroke: "#8b949e", font: AXIS_FONT, size: 52,
+        grid: { stroke: "#21262d", width: 1 }, ticks: { show: false } },
+    ],
+    legend: { live: true },
+    series,
+  };
+  return new uPlot(opts, [resp.ts, ...seriesData(chart, resp)], el);
+}
+
+function renderCharts(resp) {
+  lastResp = resp;
+  const host = $("charts");
+  const hasData = resp.ts.length &&
+    CHARTS.some(c => seriesData(c, resp).some(row => row.some(v => v != null)));
+  $("empty").style.display = hasData ? "none" : "";
+
+  for (const chart of CHARTS) {
+    let card = $("card-" + chart.key);
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "card chart-card";
+      card.id = "card-" + chart.key;
+      card.innerHTML = `<h2>${chart.title} <span class="unit meta">(${chart.unit})</span></h2><div class="plot"></div>`;
+      host.appendChild(card);
+    }
+    const mount = card.querySelector(".plot");
+    if (plots[chart.key]) {
+      plots[chart.key].setData([resp.ts, ...seriesData(chart, resp)]);
+    } else {
+      plots[chart.key] = makePlot(chart, resp, mount);
+      cursorSync.sub(plots[chart.key]);
+    }
+  }
+}
+
+// -- fetch / refresh ------------------------------------------------------
+
+let timer = null;
+async function refresh() {
+  try {
+    const r = await fetch("/api/history?range=" + range);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    renderCharts(await r.json());
+    setState("updated " + new Date().toLocaleTimeString(), "ok");
+  } catch (e) {
+    setState("fetch failed — retrying", "bad");
+  }
+  clearTimeout(timer);
+  if ($("auto").checked) timer = setTimeout(refresh, 60_000);
+}
+$("auto").addEventListener("change", () => refresh());
+
+addEventListener("resize", () => {
+  for (const chart of CHARTS) {
+    const p = plots[chart.key];
+    if (p) p.setSize({ width: chartWidth(p.root.parentElement), height: 190 });
+  }
+});
+
+// -- CSV export (table-form access to the plotted data) -------------------
+
+function exportCsv() {
+  if (!lastResp) return;
+  const cols = [], header = ["time"];
+  for (const chart of CHARTS) {
+    const labels = seriesLabels(chart, lastResp);
+    seriesData(chart, lastResp).forEach((row, i) => {
+      header.push(`${chart.key}:${labels[i]}`);
+      cols.push(row);
+    });
+  }
+  const lines = [header.join(",")];
+  lastResp.ts.forEach((t, i) => {
+    lines.push([new Date(t * 1000).toISOString(),
+                ...cols.map(c => c[i] == null ? "" : (+c[i].toFixed(3)))].join(","));
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+  a.download = `sparkdash-history-${range}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+renderRangeButtons();
+refresh();
+</script>
+</body>
+</html>

@@ -146,6 +146,7 @@ actions live under `/api/admin/*` and require login).
 |----------|--------|-----|
 | `GET /api/snapshot` | JSON (full merged state) | custom apps; tracks latest schema |
 | `GET /api/v1/snapshot` | JSON | same payload, pinned schema version |
+| `GET /api/history?range=24h` | JSON (aligned time series) | historic charts; ranges `1h 6h 24h 7d 30d 1y` |
 | `GET /metrics` | Prometheus exposition | Prometheus / Grafana scrape target |
 | `WS /ws` | JSON push every 2s | live browser clients |
 
@@ -232,6 +233,7 @@ sparkdash/app.py         FastAPI app, WebSocket broadcast, static serving
 sparkdash/admin_api.py   auth / API-token / certificate routes
 sparkdash/auth.py        password, sessions, tokens, require_admin/session gates
 sparkdash/store.py       SQLite: admin credential, sessions, tokens
+sparkdash/history.py     SQLite metrics history: 30s sampler, rollups, queries
 sparkdash/certs.py       self-signed generation, validation, anti-lockout
 sparkdash/hf.py          model preload + RDMA mirror (reuses sparkrun's code)
 sparkdash/backup.py      model backup/restore to a shared location (rsync)
@@ -240,8 +242,10 @@ sparkdash/logstream.py   live vLLM container-log streaming
 sparkdash/chat.py        streaming chat proxy to the running model
 sparkdash/admin.py       `set-password` CLI
 frontend/index.html      dashboard page (read-only)
+frontend/history.html    historic-metrics popout (uPlot charts, range picker)
 frontend/admin.html      full-page admin (login, models, tokens, cert)
 frontend/app.css         shared stylesheet
+frontend/vendor/         vendored uPlot (no CDN dependency)
 deploy/install.sh        deploy to /opt/sparkdash + enable the systemd service
 deploy/sparkdash.service systemd unit (installed path, Restart=always)
 ```
@@ -313,6 +317,10 @@ endpoints are `require_admin`. Endpoints: `GET /api/admin/recipe/current`,
 
 - Live per-node vitals (CPU, RAM, VRAM, GPU, storage) + Ray / vLLM / recipe status,
   with rolling **sparklines** (GPU utilisation, generation throughput)
+- **Metrics history** popout (`/history`): utilization, temperatures, power,
+  RAM/VRAM, storage, and throughput charted over 1h–1y, from a 30s SQLite
+  sampler (raw kept 7 days, 5-min min/avg/max rollups kept indefinitely);
+  CSV export
 - External data APIs + a Prometheus `/metrics` exporter (incl. GB10 per-process VRAM)
 - HTTPS with admin auth (password sessions + API tokens) and in-app TLS cert management
 - A tabbed admin page: **Recipes · Models · Chat · Settings**

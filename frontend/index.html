@@ -12,6 +12,7 @@
   <div style="display:flex; gap:14px; align-items:center;">
     <span class="meta" id="clock">—</span>
     <span class="status-pill"><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></span>
+    <button class="btn" onclick="openHistory()">History</button>
     <a class="btn" href="/admin">Admin</a>
   </div>
 </header>
@@ -182,6 +183,10 @@ function renderNodes(nodes) {
         ${bar(n.cpu_pct)}
       </div>
       <div class="stat">
+        <div class="top-line"><span>GPU</span><span class="sub">${pct(n.gpu_util_pct)} · ${n.gpu_temp_c ?? "—"}°C · ${n.gpu_power_w != null ? n.gpu_power_w.toFixed(0)+" W" : "—"}</span></div>
+        ${bar(n.gpu_util_pct)}
+      </div>
+      <div class="stat">
         <div class="top-line"><span>RAM</span><span class="sub">${fmtMB(n.mem_used_mb)} / ${fmtMB(n.mem_total_mb)} · ${pct(memPct)}</span></div>
         ${bar(memPct)}
       </div>
@@ -196,9 +201,6 @@ function renderNodes(nodes) {
 
       <div class="chips">
         <span class="chip">GPU <b>${n.gpu_name || "—"}</b></span>
-        <span class="chip">util <b>${pct(n.gpu_util_pct)}</b></span>
-        <span class="chip">${n.gpu_temp_c ?? "—"}°C</span>
-        <span class="chip">${n.gpu_power_w != null ? n.gpu_power_w.toFixed(0)+" W" : "—"}</span>
         <span class="chip">${n.gpu_clock_mhz != null ? n.gpu_clock_mhz.toFixed(0)+" MHz" : "—"}</span>
         <span class="chip">up <b>${fmtDuration(n.uptime_sec)}</b></span>
       </div>
@@ -213,6 +215,9 @@ function renderNodes(nodes) {
 
 function openLogs() {
   window.open("/logs", "sparkdash-logs", "width=1100,height=720");
+}
+function openHistory() {
+  window.open("/history", "sparkdash-history", "width=1500,height=950");
 }
 
 let _lastGen = null, _lastTs = null, _prevHealthy = null, _prevOnline = {};

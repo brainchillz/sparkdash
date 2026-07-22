@@ -15,7 +15,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, logstream, store
+from . import config, history, logstream, store
 from .admin_api import router as admin_router
 from .collectors import Hub
 from .metrics import render_prometheus
@@ -29,23 +29,27 @@ app.include_router(admin_router)
 hub = Hub()
 clients: set[WebSocket] = set()
 _broadcaster: asyncio.Task | None = None
+_sampler: asyncio.Task | None = None
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _broadcaster
+    global _broadcaster, _sampler
     store.init_db()
     store.purge_expired_sessions()
+    history.init_db()
     hub.start()
     _broadcaster = asyncio.create_task(_broadcast_loop())
+    _sampler = asyncio.create_task(history.sampler_loop(hub))
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    if _broadcaster:
-        _broadcaster.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await _broadcaster
+    for task in (_broadcaster, _sampler):
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
     await hub.stop()
 
 
@@ -57,7 +61,9 @@ async def _broadcast_loop() -> None:
             continue
         snap = hub.snapshot()
         dead: list[WebSocket] = []
-        for ws in clients:
+        # Iterate a copy: the set mutates if a client (dis)connects while a
+        # send is awaited (seen as RuntimeError during shutdown).
+        for ws in list(clients):
             try:
                 await ws.send_json(snap)
             except Exception:
@@ -74,6 +80,17 @@ async def snapshot() -> JSONResponse:
     `/api/v1/snapshot` is the versioned alias; `/api/snapshot` tracks latest.
     """
     return JSONResponse(hub.snapshot())
+
+
+@app.get("/api/history")
+async def api_history(range: str = "24h") -> JSONResponse:
+    """Historic metrics for the /history page: all series bucket-averaged
+    to a shared time axis. Ranges: 1h, 6h, 24h, 7d, 30d, 1y."""
+    if range not in history.RANGES:
+        return JSONResponse(
+            {"error": f"unknown range {range!r}",
+             "ranges": sorted(history.RANGES)}, status_code=400)
+    return JSONResponse(await asyncio.to_thread(history.query, range))
 
 
 @app.get("/metrics")
@@ -166,6 +183,11 @@ async def admin_page() -> FileResponse:
 @app.get("/logs")
 async def logs_page() -> FileResponse:
     return FileResponse(FRONTEND / "logs.html")
+
+
+@app.get("/history")
+async def history_page() -> FileResponse:
+    return FileResponse(FRONTEND / "history.html")
 
 
 # Static assets (css/js) if we split them out later.

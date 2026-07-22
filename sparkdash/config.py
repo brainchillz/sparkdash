@@ -80,6 +80,18 @@ CERT_FILE = CERT_DIR / "cert.pem"
 KEY_FILE = CERT_DIR / "key.pem"
 DB_FILE = DATA_DIR / "sparkdash.db"
 
+# -- Metrics history ------------------------------------------------------
+#
+# A background sampler persists one row per node (plus one cluster row for
+# vLLM throughput) every HISTORY_INTERVAL seconds. Raw rows older than
+# HISTORY_RAW_KEEP are folded into HISTORY_BUCKET-second min/avg/max rollups
+# kept indefinitely (two nodes ≈ 1 MB/day raw, far less rolled up).
+HISTORY_DB = DATA_DIR / "history.db"
+HISTORY_INTERVAL = 30.0
+HISTORY_RAW_KEEP = 7 * 86400
+HISTORY_BUCKET = 300
+HISTORY_MAX_POINTS = 400   # per-series cap on /api/history responses
+
 # Admin identity. Username is non-default to slow trivial guessing; the
 # password is set out-of-band via `python -m sparkdash.admin set-password`.
 ADMIN_USER = os.environ.get("SPARKDASH_ADMIN_USER", _cfg.get("admin_user", "sparkadmin"))
