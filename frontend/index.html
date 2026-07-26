@@ -27,7 +27,7 @@
       <div id="recipe-body"><span class="meta">waiting for data…</span></div>
     </div>
     <div class="card" id="ray-card">
-      <h2>Ray Cluster</h2>
+      <h2 id="ray-title">Ray Cluster</h2>
       <div id="ray-body"><span class="meta">waiting for data…</span></div>
     </div>
   </div>
@@ -101,41 +101,52 @@ function renderRecipe(r) {
   }
   const conts = (r.containers || []).map(c =>
     `<span class="chip">${c.role} · <b>${c.ip}</b> · ${c.status}</span>`).join("");
+  const par = `tp=${r.tp}` + (r.pp && r.pp > 1 ? ` · pp=${r.pp}` : "");
   $("recipe-body").innerHTML =
-    `<div class="big">${r.name} <span class="meta">tp=${r.tp}</span></div>
+    `<div class="big">${r.name} <span class="meta">${par}</span></div>
      <div class="meta" style="margin:2px 0 12px">job ${r.id}</div>
      <div class="chips">${conts}</div>`;
 }
 
-function renderRay(ray, vllm) {
-  if (!ray || !ray.reachable) {
-    $("ray-body").innerHTML = `<span class="meta">Ray dashboard unreachable.</span>`;
-  } else {
+function renderRay(ray, vllm, recipe, nodeCount) {
+  // Solo jobs / single-node installs run without Ray — drop the Ray section
+  // entirely and let this card be pure vLLM status.
+  const solo = (recipe && recipe.running && recipe.solo) || nodeCount <= 1;
+  let html = "";
+  if (ray && ray.reachable) {
     const nodes = (ray.nodes || []).map(n => {
       const d = n.state === "ALIVE" ? "ok" : "bad";
       const tag = n.is_head ? "head" : "worker";
       return `<div class="kv"><span class="k"><span class="dot ${d}" style="display:inline-block;margin-right:6px"></span>${n.node_ip} <span class="meta">${tag}</span></span>` +
              `<span class="v">${n.cpu ?? "—"} CPU · ${n.gpu ?? "—"} GPU · ${fmtBytes(n.memory_bytes)}</span></div>`;
     }).join("");
-    $("ray-body").innerHTML =
-      kv("Nodes alive", `${ray.nodes_alive}/${ray.nodes_total}`) + nodes;
+    html = kv("Nodes alive", `${ray.nodes_alive}/${ray.nodes_total}`) + nodes;
+  } else if (!solo) {
+    html = `<span class="meta">Ray dashboard unreachable.</span>`;
   }
-  // vLLM health also surfaces here as a quick line.
-  const vd = vllm && vllm.healthy ? "ok" : (vllm && vllm.reachable ? "warn" : "bad");
-  const vt = vllm && vllm.healthy ? "healthy" : (vllm && vllm.reachable ? "reachable" : "down");
+  $("ray-title").textContent = html ? "Ray Cluster" : "vLLM";
+  // vLLM health also surfaces here as a quick line (the whole card, when solo).
+  const sep = html ? "margin-top:10px;border-top:1px solid var(--border);padding-top:10px" : "";
+  let vd = vllm && vllm.healthy ? "ok" : (vllm && vllm.reachable ? "warn" : "bad");
+  let vt = vllm && vllm.healthy ? "healthy" : (vllm && vllm.reachable ? "reachable" : "down");
+  // Recipe container up but the API not answering = almost always still
+  // loading weights — amber "starting", not a red "down".
+  if (recipe && recipe.running && (!vllm || !vllm.reachable)) { vd = "warn"; vt = "starting…"; }
   const model = vllm && vllm.model ? vllm.model : "—";
-  $("ray-body").innerHTML +=
-    `<div class="kv" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+  $("ray-body").innerHTML = html +
+    `<div class="kv" style="${sep}">
        <span class="k"><span class="dot ${vd}" style="display:inline-block;margin-right:6px"></span>vLLM</span>
        <span class="v">${vt}</span></div>` +
     `<div class="model-name">${model}</div>` +
     (vllm && vllm.max_model_len ? `<div class="meta">context ${(vllm.max_model_len/1000).toFixed(0)}k tokens</div>` : "");
 }
 
-function renderVllm(vllm) {
+function renderVllm(vllm, recipe) {
   const m = (vllm && vllm.metrics) || {};
   if (!vllm || !vllm.reachable) {
-    $("vllm-body").innerHTML = `<span class="meta">vLLM endpoint unreachable.</span>`;
+    $("vllm-body").innerHTML = recipe && recipe.running
+      ? `<span class="meta">vLLM not answering yet — model starting or restarting.</span>`
+      : `<span class="meta">vLLM endpoint unreachable.</span>`;
     return;
   }
   const running = m["vllm:num_requests_running"] ?? 0;
@@ -162,6 +173,7 @@ function renderVllm(vllm) {
 
 function renderNodes(nodes) {
   const host = $("nodes");
+  host.classList.toggle("single", (nodes || []).length === 1);
   host.innerHTML = (nodes || []).map(n => {
     const cls = n.online ? "" : "offline";
     const d = n.online ? "ok" : "bad";
@@ -178,6 +190,7 @@ function renderNodes(nodes) {
         <span class="meta">${n.hostname || n.ip}</span>
       </div>
 
+      <div class="stats">
       <div class="stat">
         <div class="top-line"><span>CPU</span><span class="sub">${pct(n.cpu_pct)} · load ${n.cpu_load_1m ?? "—"} · ${n.cpu_temp_c ?? "—"}°C</span></div>
         ${bar(n.cpu_pct)}
@@ -198,16 +211,17 @@ function renderNodes(nodes) {
         <div class="top-line"><span>Storage</span><span class="sub">${fmtBytes(n.disk_used)} / ${fmtBytes(n.disk_total)}</span></div>
         ${bar(diskPct)}
       </div>
-
-      <div class="chips">
-        <span class="chip">GPU <b>${n.gpu_name || "—"}</b></span>
-        <span class="chip">${n.gpu_clock_mhz != null ? n.gpu_clock_mhz.toFixed(0)+" MHz" : "—"}</span>
-        <span class="chip">up <b>${fmtDuration(n.uptime_sec)}</b></span>
       </div>
 
       <div style="margin-top:12px">
         <div class="top-line" style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted)"><span>GPU util history</span><span>~5 min</span></div>
         ${spark("gpu:"+n.name, {h:26, fixedMax:100, color:"#58a6ff"}) || `<span class="meta">gathering…</span>`}
+      </div>
+
+      <div class="chips">
+        <span class="chip">GPU <b>${n.gpu_name || "—"}</b></span>
+        <span class="chip">${n.gpu_clock_mhz != null ? n.gpu_clock_mhz.toFixed(0)+" MHz" : "—"}</span>
+        <span class="chip">up <b>${fmtDuration(n.uptime_sec)}</b></span>
       </div>
     </div>`;
   }).join("");
@@ -248,8 +262,8 @@ function render(snap) {
   });
 
   renderRecipe(snap.recipe);
-  renderRay(snap.ray, snap.vllm);
-  renderVllm(snap.vllm);
+  renderRay(snap.ray, snap.vllm, snap.recipe, snap.node_count);
+  renderVllm(snap.vllm, snap.recipe);
   renderNodes(snap.nodes);
 }
 

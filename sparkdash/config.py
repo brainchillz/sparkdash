@@ -4,11 +4,17 @@ Cluster topology (nodes, addresses, SSH user) is loaded from a TOML file so no
 site-specific addresses live in the source. Search order:
 
   1. $SPARKDASH_CONFIG
-  2. ~/.config/sparkdash/config.toml
-  3. <repo>/sparkdash.toml
+  2. /etc/sparkdash/config.toml        (installed deployments)
+  3. ~/.config/sparkdash/config.toml   (dev fallback)
+  4. <repo>/sparkdash.toml
 
 See sparkdash.example.toml for the format. With no config file, SparkDash
 falls back to a single local node so it still imports and runs.
+
+Runtime state (password DB, TLS certs, metrics history) likewise prefers the
+system location: /var/lib/sparkdash when it exists (deploy/install.sh creates
+it), else ~/.local/share/sparkdash for dev checkouts. This keeps state in a
+stable place independent of whichever user happens to run a CLI command.
 
 Control/API traffic (Ray, vLLM, sparkrun, the node probe) uses each node's
 management address; an optional per-node `rdma` address is used for bulk file
@@ -24,6 +30,7 @@ def _load() -> dict:
     candidates = []
     if os.environ.get("SPARKDASH_CONFIG"):
         candidates.append(Path(os.environ["SPARKDASH_CONFIG"]))
+    candidates.append(Path("/etc/sparkdash/config.toml"))
     candidates.append(Path(os.path.expanduser("~/.config/sparkdash/config.toml")))
     candidates.append(Path(__file__).resolve().parent.parent / "sparkdash.toml")
     for p in candidates:
@@ -72,9 +79,15 @@ BROADCAST_INTERVAL = 2.0
 
 PORT = int(os.environ.get("SPARKDASH_PORT", "7862"))
 
-# Persistent state lives outside the repo so it can't be committed.
-DATA_DIR = Path(os.environ.get(
-    "SPARKDASH_DATA_DIR", os.path.expanduser("~/.local/share/sparkdash")))
+# Persistent state lives outside the repo so it can't be committed. Installed
+# deployments use /var/lib/sparkdash (created by deploy/install.sh) so state
+# doesn't depend on any user's home directory; the home path is only a dev
+# fallback when the system dir doesn't exist.
+_SYSTEM_DATA = Path("/var/lib/sparkdash")
+DATA_DIR = Path(
+    os.environ.get("SPARKDASH_DATA_DIR")
+    or (_SYSTEM_DATA if _SYSTEM_DATA.is_dir()
+        else os.path.expanduser("~/.local/share/sparkdash")))
 CERT_DIR = DATA_DIR / "certs"
 CERT_FILE = CERT_DIR / "cert.pem"
 KEY_FILE = CERT_DIR / "key.pem"

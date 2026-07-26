@@ -41,6 +41,7 @@ class Hub:
         self._probe: dict[str, dict] = {}         # node name -> {vram_mib,disk_used,disk_total}
         self._ray: dict[str, Any] = {"reachable": False}
         self._vllm: dict[str, Any] = {"reachable": False}
+        self._vllm_fails = 0
         self._recipe: dict[str, Any] = {"running": False}
         self._client = httpx.AsyncClient(timeout=4.0)
         self._tasks: list[asyncio.Task] = []
@@ -185,11 +186,20 @@ class Hub:
         state: dict[str, Any] = {"reachable": False, "healthy": False}
         try:
             h = await self._client.get(f"{config.VLLM_BASE}/health")
-            state["reachable"] = True
-            state["healthy"] = h.status_code == 200
-        except Exception:
-            self._vllm = state
+        except Exception as exc:
+            # One dropped request must not flap the UI red: keep the last good
+            # state until a second consecutive cycle also fails. Log only while
+            # we still believed vLLM was up, so a steady-state outage doesn't
+            # spam the journal every cycle.
+            self._vllm_fails += 1
+            if self._vllm.get("reachable"):
+                self._note_error("poll_vllm", exc)
+            if self._vllm_fails >= 2 or not self._vllm.get("reachable"):
+                self._vllm = state
             return
+        self._vllm_fails = 0
+        state["reachable"] = True
+        state["healthy"] = h.status_code == 200
 
         try:
             m = await self._client.get(f"{config.VLLM_BASE}/v1/models")
@@ -327,13 +337,15 @@ def _parse_vllm_metrics(text: str) -> dict[str, float]:
     return out
 
 
-# Header line, e.g.:  "Job: minimax-2.7  (tp=2)  [e6b6dfeb53aa]  (2 container(s))"
+# Header line. Cluster jobs: "Job: minimax-2.7  (tp=2)  [e6b6dfeb53aa]  (2 container(s))"
+# Solo jobs (newer sparkrun): "Job: @official/foo-vllm  (tp=1, pp=1)  [d6b0...]  (1 container(s))"
 _JOB_RE = re.compile(
-    r"Job:\s+(?P<name>\S+)\s+\(tp=(?P<tp>\d+)\)\s+\[(?P<id>[0-9a-f]+)\]"
+    r"Job:\s+(?P<name>\S+)\s+\(tp=(?P<tp>\d+)(?:,\s*pp=(?P<pp>\d+))?\)\s+\[(?P<id>[0-9a-f]+)\]"
 )
 # Container line, e.g.: "  head  <host>  Up 5 days  vllm-node-xxxxx"
+# Single-node jobs report role "solo".
 _CONT_RE = re.compile(
-    r"^\s+(head|worker)\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<status>Up[^\n]*?)\s{2,}\S+\s*$"
+    r"^\s+(head|worker|solo)\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<status>Up[^\n]*?)\s{2,}\S+\s*$"
 )
 
 
@@ -360,6 +372,8 @@ def _parse_status(text: str) -> dict:
         "running": True,
         "name": name,
         "tp": int(m.group("tp")),
+        "pp": int(m.group("pp")) if m.group("pp") else None,
         "id": m.group("id"),
+        "solo": any(c["role"] == "solo" for c in containers),
         "containers": containers,
     }

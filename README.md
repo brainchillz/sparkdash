@@ -13,8 +13,8 @@ Must run on the **head node** — the Ray dashboard binds to `127.0.0.1`.
 Serves **HTTPS**; a self-signed cert is generated on first run.
 
 First, configure your cluster (copy `sparkdash.example.toml` to
-`~/.config/sparkdash/config.toml` and fill in your nodes — see
-[Configuration](#configuration)). Then:
+`/etc/sparkdash/config.toml` — or `~/.config/sparkdash/config.toml` for a dev
+checkout — and fill in your nodes, see [Configuration](#configuration)). Then:
 
 ```bash
 ./run.sh                 # https://<head-host>:7862
@@ -47,9 +47,12 @@ SPARKDASH_PREFIX=/srv/sparkdash ./deploy/install.sh   # custom location
 ```
 
 It's **idempotent** — re-run it to deploy changes (it re-syncs the code,
-re-locks the venv, and restarts the service). Runtime state
-(`~/.local/share/sparkdash`: DB + certs) is never touched, so the admin
-password and certificate survive updates.
+re-locks the venv, and restarts the service). The install dir holds runtime
+files only; config lives in `/etc/sparkdash/` and state (password DB, TLS
+certs, metrics history) in `/var/lib/sparkdash/`, which updates never touch —
+the admin password and certificate survive updates. `--set-password` sets the
+admin password as part of the install. Pre-existing home-directory state and
+config from older installs are migrated in automatically on first run.
 
 ```bash
 systemctl status sparkdash        # state
@@ -66,14 +69,15 @@ the dev checkout for iteration.
 
 Cluster topology (node IPs, SSH user) lives in a TOML file — no addresses are
 baked into the source. It's searched in order: `$SPARKDASH_CONFIG`,
-`~/.config/sparkdash/config.toml`, then `<repo>/sparkdash.toml`. With no config
-file, SparkDash runs single-node against localhost.
+`/etc/sparkdash/config.toml`, `~/.config/sparkdash/config.toml`, then
+`<repo>/sparkdash.toml`. With no config file, SparkDash runs single-node
+against localhost.
 
 Copy the template and edit it:
 
 ```bash
-cp sparkdash.example.toml ~/.config/sparkdash/config.toml
-$EDITOR ~/.config/sparkdash/config.toml
+sudo cp sparkdash.example.toml /etc/sparkdash/config.toml
+sudo $EDITOR /etc/sparkdash/config.toml
 ```
 
 ```toml

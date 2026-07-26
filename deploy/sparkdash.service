@@ -15,6 +15,10 @@ Group=nvidia
 # path if SPARKDASH_PREFIX is overridden. Not the dev checkout.
 WorkingDirectory=/opt/sparkdash
 
+# Persistent state (password DB, TLS certs, metrics history) lives in
+# /var/lib/sparkdash; systemd creates it owned by the service user.
+StateDirectory=sparkdash
+
 # HOME is needed so the SSH probe finds ~/.ssh keys/known_hosts; PATH must
 # include ~/.local/bin (sparkrun) and /usr/bin (ssh, nvidia-smi, df, awk).
 Environment=HOME=/home/nvidia

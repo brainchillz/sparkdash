@@ -105,7 +105,10 @@ async def current_recipe() -> dict:
     out, _ = await asyncio.wait_for(proc.communicate(), timeout=25.0)
     rec = _parse_status(out.decode(errors="replace"))
     if rec.get("running"):
-        rec["mode"] = "cluster" if len(rec.get("containers", [])) > 1 else "solo"
+        # sparkrun labels single-node jobs with role "solo"; fall back to the
+        # container count for older versions that only print head/worker.
+        solo = rec.get("solo") or len(rec.get("containers", [])) <= 1
+        rec["mode"] = "solo" if solo else "cluster"
     return rec
 
 
