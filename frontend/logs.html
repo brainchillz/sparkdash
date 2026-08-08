@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1b1c1e">
 <title>SparkDash · Logs</title>
 <link rel="stylesheet" href="/static/app.css">
 <style>
@@ -11,10 +12,10 @@
   header { flex: none; }
   .term {
     flex: 1; overflow-y: auto; margin: 0; padding: 12px 16px;
-    background: #010409; font-family: ui-monospace, Menlo, Consolas, monospace;
-    font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+    background: #131416; font-family: var(--mono);
+    font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
   }
-  .term .ln { color: #c9d1d9; }
+  .term .ln { color: #c6c2ba; }
   .term .sys { color: var(--accent); }
   .term.hide-noise .noise { display: none; }
   .toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }

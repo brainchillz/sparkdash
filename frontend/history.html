@@ -3,12 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1b1c1e">
 <title>SparkDash · History</title>
 <link rel="stylesheet" href="/static/app.css">
 <link rel="stylesheet" href="/static/vendor/uPlot.min.css">
 <style>
-  /* Series colors live in NODE_COLORS below — a categorical pair validated
-     for the dark card surface. Color follows the node, never its position. */
+  /* Series colors live in NODE_COLORS below — a categorical set (orange-led,
+     Nexus identity) validated for the dark card surface. Color follows the
+     node, never its position. */
   .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .controls .btn.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
   .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
@@ -47,8 +49,8 @@
 <script>
 const $ = (id) => document.getElementById(id);
 
-const NODE_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500"]; // fixed slot order
-const CLUSTER_COLOR = "#199e70";
+const NODE_COLORS = ["#d96a1e", "#5f8ed6", "#7d9e54", "#b3689c"]; // fixed slot order
+const CLUSTER_COLOR = "#7d9e54";
 const RANGES = ["1h", "6h", "24h", "7d", "30d", "1y"];
 const mb2gb = (v) => v == null ? null : v / 1024;
 
@@ -104,7 +106,7 @@ function seriesLabels(chart, resp) {
 
 // -- charts ---------------------------------------------------------------
 
-const AXIS_FONT = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+const AXIS_FONT = "11px ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace";
 const cursorSync = uPlot.sync("hist");
 
 function chartWidth(el) { return el.clientWidth; } // .plot already sits inside the card padding
@@ -127,10 +129,10 @@ function makePlot(chart, resp, el) {
     scales: { y: chart.max ? { range: [0, chart.max] } : {} },
     cursor: { sync: { key: "hist", setSeries: false }, points: { size: 8 } },
     axes: [
-      { stroke: "#8b949e", font: AXIS_FONT,
-        grid: { stroke: "#21262d", width: 1 }, ticks: { stroke: "#30363d" } },
-      { stroke: "#8b949e", font: AXIS_FONT, size: 52,
-        grid: { stroke: "#21262d", width: 1 }, ticks: { show: false } },
+      { stroke: "#8f8b82", font: AXIS_FONT,
+        grid: { stroke: "#2f2e2b", width: 1 }, ticks: { stroke: "#3a3833" } },
+      { stroke: "#8f8b82", font: AXIS_FONT, size: 52,
+        grid: { stroke: "#2f2e2b", width: 1 }, ticks: { show: false } },
     ],
     legend: { live: true },
     series,

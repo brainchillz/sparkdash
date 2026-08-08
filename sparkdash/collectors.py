@@ -38,6 +38,7 @@ class Hub:
     def __init__(self) -> None:
         # Latest raw pieces of state, updated independently by each task.
         self._monitor: dict[str, dict] = {}      # node name -> monitor frame
+        self._monitor_ts: dict[str, float] = {}  # node name -> monotonic frame time
         self._probe: dict[str, dict] = {}         # node name -> {vram_mib,disk_used,disk_total}
         self._ray: dict[str, Any] = {"reachable": False}
         self._vllm: dict[str, Any] = {"reachable": False}
@@ -82,7 +83,13 @@ class Hub:
     async def _run_monitor_stream(self) -> None:
         """Consume `sparkrun cluster monitor --json` as an NDJSON stream.
 
-        Restarts the subprocess if it exits (e.g. transient SSH hiccup).
+        Restarts the subprocess if it exits (e.g. transient SSH hiccup) or
+        wedges. sparkrun never retries a host connection that hangs before
+        its first sample — it streams `{"connecting": true}` placeholder
+        frames forever (seen after a boot where the nodes' sshd wasn't up
+        yet when the stream started) — so only frames carrying real host
+        data reset the staleness clock, and a stream that goes
+        MONITOR_STALE without one is killed and respawned.
         """
         while True:
             proc = None
@@ -95,7 +102,12 @@ class Hub:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 assert proc.stdout is not None
-                async for raw in proc.stdout:
+                last_data = time.monotonic()
+                while True:
+                    raw = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=config.MONITOR_STALE)
+                    if not raw:      # EOF: subprocess exited
+                        break
                     line = raw.decode(errors="replace").strip()
                     if not line:
                         continue
@@ -103,15 +115,28 @@ class Hub:
                         frame = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    now = time.monotonic()
                     for ip, data in frame.get("hosts", {}).items():
+                        # Placeholder frames ({"connecting": true} /
+                        # {"error": ...}) carry no metrics; storing them
+                        # would render as an online node with blank stats.
+                        if not isinstance(data, dict) or "hostname" not in data:
+                            continue
                         name = config.IP_TO_NODE.get(ip, ip)
                         self._monitor[name] = data
+                        self._monitor_ts[name] = now
+                        last_data = now
+                    if time.monotonic() - last_data > config.MONITOR_STALE:
+                        raise TimeoutError(
+                            "no host data for %.0fs (stream wedged)"
+                            % config.MONITOR_STALE)
             except asyncio.CancelledError:
-                if proc and proc.returncode is None:
-                    proc.terminate()
                 raise
             except Exception as exc:
                 self._note_error("monitor_stream", exc)
+            finally:
+                if proc and proc.returncode is None:
+                    proc.terminate()
             # Stream ended or errored; pause and respawn.
             await asyncio.sleep(3.0)
 
@@ -234,8 +259,13 @@ class Hub:
 
     def snapshot(self) -> dict:
         nodes = []
+        now = time.monotonic()
         for n in config.NODES:
             mon = self._monitor.get(n["name"], {})
+            # Expire monitor data the stream hasn't refreshed: presenting a
+            # node as online with old numbers is worse than showing it down.
+            if now - self._monitor_ts.get(n["name"], 0.0) > config.MONITOR_STALE:
+                mon = {}
             probe = self._probe.get(n["name"], {})
             nodes.append({
                 "name": n["name"],

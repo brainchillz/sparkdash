@@ -74,6 +74,7 @@ SPARKRUN_CLUSTER = _cfg.get("sparkrun_cluster", "default")
 SLOW_POLL = 5.0        # Ray, vLLM, node probe (VRAM + disk)
 STATUS_POLL = 12.0     # `sparkrun status` (spawns SSH, keep it gentle)
 BROADCAST_INTERVAL = 2.0
+MONITOR_STALE = 15.0   # no real monitor frame for this long -> stream is wedged
 
 # -- Serving / data / auth ------------------------------------------------
 

@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1b1c1e">
 <title>SparkDash · Admin</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
@@ -73,7 +74,7 @@
           <span><b id="op-action"></b> <span class="meta" id="op-phase"></span></span>
         </div>
         <div id="op-msg" class="meta" style="margin:4px 0"></div>
-        <pre id="op-output" style="max-height:240px; overflow:auto; background:#010409; margin:0; padding:10px; border-radius:7px; font-family:ui-monospace,monospace; font-size:11px; white-space:pre-wrap; color:#c9d1d9"></pre>
+        <pre id="op-output" style="max-height:240px; overflow:auto; background:#131416; margin:0; padding:10px; border-radius:2px; border:1px solid var(--border); font-family:var(--mono); font-size:11px; white-space:pre-wrap; color:#c6c2ba"></pre>
       </div>
     </div>
     </div><!-- /tab-recipes -->
@@ -138,7 +139,7 @@
     <div class="card">
       <h2>Chat &mdash; test the running model</h2>
       <div id="chat-model" class="meta" style="margin-bottom:10px">…</div>
-      <div id="chat-log" style="height:340px; overflow-y:auto; background:#010409; border:1px solid var(--border); border-radius:8px; padding:12px; display:flex; flex-direction:column; gap:10px"></div>
+      <div id="chat-log" style="height:340px; overflow-y:auto; background:#131416; border:1px solid var(--border); border-radius:2px; padding:12px; display:flex; flex-direction:column; gap:10px"></div>
       <div class="err" id="chat-err"></div>
       <div class="row" style="margin-top:10px; align-items:flex-end; gap:8px">
         <textarea id="chat-input" rows="2" placeholder="Ask the model something…  (Enter to send, Shift+Enter for newline)" style="flex:1" onkeydown="chatKey(event)"></textarea>

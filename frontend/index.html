@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1b1c1e">
 <title>SparkDash</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
@@ -76,7 +77,7 @@ function push(key, val) {
   (hist[key] = hist[key] || []).push(val);
   if (hist[key].length > HIST_MAX) hist[key].shift();
 }
-function spark(key, { h = 22, color = "#58a6ff", fixedMax = null } = {}) {
+function spark(key, { h = 22, color = "#d96a1e", fixedMax = null } = {}) {
   const data = hist[key] || [];
   if (data.length < 2) return "";
   const vw = 300;
@@ -167,7 +168,7 @@ function renderVllm(vllm, recipe) {
   </div>
   <div style="margin-top:12px">
     <div class="top-line" style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted)"><span>generation throughput</span><span>${tps==null?"":tps.toFixed(1)+" tok/s"}</span></div>
-    ${spark("tokps", {h:30, color:"#3fb950"}) || `<span class="meta">gathering…</span>`}
+    ${spark("tokps", {h:30, color:"#7d9e54"}) || `<span class="meta">gathering…</span>`}
   </div>`;
 }
 
@@ -215,7 +216,7 @@ function renderNodes(nodes) {
 
       <div style="margin-top:12px">
         <div class="top-line" style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted)"><span>GPU util history</span><span>~5 min</span></div>
-        ${spark("gpu:"+n.name, {h:26, fixedMax:100, color:"#58a6ff"}) || `<span class="meta">gathering…</span>`}
+        ${spark("gpu:"+n.name, {h:26, fixedMax:100, color:"#d96a1e"}) || `<span class="meta">gathering…</span>`}
       </div>
 
       <div class="chips">
