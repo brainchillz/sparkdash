@@ -116,16 +116,33 @@ class Hub:
                     except json.JSONDecodeError:
                         continue
                     now = time.monotonic()
-                    for ip, data in frame.get("hosts", {}).items():
-                        # Placeholder frames ({"connecting": true} /
-                        # {"error": ...}) carry no metrics; storing them
-                        # would render as an online node with blank stats.
-                        if not isinstance(data, dict) or "hostname" not in data:
-                            continue
-                        name = config.IP_TO_NODE.get(ip, ip)
-                        self._monitor[name] = data
-                        self._monitor_ts[name] = now
-                        last_data = now
+                    hosts = frame.get("hosts", {})
+                    if isinstance(hosts, list):
+                        # New sparkrun monitor format
+                        for entry in hosts:
+                            if not isinstance(entry, dict):
+                                continue
+
+                            ip = entry.get("host")
+                            data = entry.get("sample")
+
+                            if not ip or not isinstance(data, dict):
+                                continue
+
+                            name = config.IP_TO_NODE.get(ip, ip)
+                            self._monitor[name] = data
+                            self._monitor_ts[name] = now
+                            last_data = now
+                    elif isinstance(hosts, dict):
+                        # Legacy sparkrun monitor format
+                        for ip, data in hosts.items():
+                            if not isinstance(data, dict) or "hostname" not in data:
+                                continue
+
+                            name = config.IP_TO_NODE.get(ip, ip)
+                            self._monitor[name] = data
+                            self._monitor_ts[name] = now
+                            last_data = now
                     if time.monotonic() - last_data > config.MONITOR_STALE:
                         raise TimeoutError(
                             "no host data for %.0fs (stream wedged)"
@@ -369,13 +386,15 @@ def _parse_vllm_metrics(text: str) -> dict[str, float]:
 
 # Header line. Cluster jobs: "Job: minimax-2.7  (tp=2)  [e6b6dfeb53aa]  (2 container(s))"
 # Solo jobs (newer sparkrun): "Job: @official/foo-vllm  (tp=1, pp=1)  [d6b0...]  (1 container(s))"
+# The cluster id may contain an underscore (e.g. "87d86de3a16ecbe2_d14309ba4e35").
 _JOB_RE = re.compile(
-    r"Job:\s+(?P<name>\S+)\s+\(tp=(?P<tp>\d+)(?:,\s*pp=(?P<pp>\d+))?\)\s+\[(?P<id>[0-9a-f]+)\]"
+    r"Job:\s+(?P<name>\S+)\s+\(tp=(?P<tp>\d+)(?:,\s*pp=(?P<pp>\d+))?\)\s+\[(?P<id>[0-9a-f_]+)\]"
 )
-# Container line, e.g.: "  head  <host>  Up 5 days  vllm-node-xxxxx"
-# Single-node jobs report role "solo".
+# Container line, e.g.: "  node_0  192.168.0.67  Up 5 hours  vllm-...:tag"
+# The role is the node name (node_0, node_1, ...); older versions used
+# head/worker/solo.
 _CONT_RE = re.compile(
-    r"^\s+(head|worker|solo)\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<status>Up[^\n]*?)\s{2,}\S+\s*$"
+    r"^\s+(?P<role>\S+)\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<status>Up[^\n]*?)\s{2,}\S+\s*$"
 )
 
 
