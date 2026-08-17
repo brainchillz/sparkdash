@@ -365,7 +365,11 @@ class Hub:
                           "content": "Reply with exactly: CANARY OK"}],
             "max_tokens": config.CANARY_MAX_TOKENS,
             "stream": True,
-            "chat_template_kwargs": {"thinking": False},
+            # Both spellings of "don't think": DeepSeek templates use
+            # `thinking`, Qwen templates use `enable_thinking`. Jinja ignores
+            # whichever one a template doesn't know.
+            "chat_template_kwargs": {"thinking": False,
+                                     "enable_thinking": False},
         }
         text, t0, t_first = "", time.monotonic(), None
         try:
@@ -520,7 +524,8 @@ def _f(val: Any) -> float | None:
 # metric-name -> value, ignoring labels. We only keep the last sample per name,
 # which is correct for this single-engine deployment. `_created` timestamp
 # series are skipped so they can't be mistaken for counters.
-_METRIC_RE = re.compile(r"^(vllm:[a-zA-Z_]+)(?:\{[^}]*\})?\s+([0-9eE.+\-]+)$")
+_METRIC_RE = re.compile(
+    r"^((?:vllm|sglang):[a-zA-Z_]+)(?:\{[^}]*\})?\s+([0-9eE.+\-]+)$")
 
 _WANTED = {
     "vllm:num_requests_running",
@@ -534,6 +539,19 @@ _WANTED = {
     "vllm:request_success_total",
 }
 
+# SGLang serves the same concepts under its own prefix (run with
+# --enable-metrics). Normalised to the vllm: names so every consumer —
+# frontend, history sampler, Prometheus exporter — is engine-agnostic.
+_SGLANG_MAP = {
+    "sglang:num_running_reqs": "vllm:num_requests_running",
+    "sglang:num_queue_reqs": "vllm:num_requests_waiting",
+    "sglang:token_usage": "vllm:kv_cache_usage_perc",
+    "sglang:prompt_tokens_total": "vllm:prompt_tokens_total",
+    "sglang:generation_tokens_total": "vllm:generation_tokens_total",
+    "sglang:num_requests_total": "vllm:request_success_total",
+    "sglang:cache_hit_rate": "prefix_cache_hit_rate",   # already a 0-1 ratio
+}
+
 
 def _parse_vllm_metrics(text: str) -> dict[str, float]:
     out: dict[str, float] = {}
@@ -544,12 +562,13 @@ def _parse_vllm_metrics(text: str) -> dict[str, float]:
         if not m:
             continue
         name, value = m.group(1), m.group(2)
-        if name in _WANTED:
+        name = _SGLANG_MAP.get(name, name)
+        if name in _WANTED or name == "prefix_cache_hit_rate":
             try:
                 out[name] = out.get(name, 0.0) + float(value)
             except ValueError:
                 pass
-    # Derived: prefix-cache hit rate.
+    # Derived: prefix-cache hit rate (vLLM exposes the two counters instead).
     q = out.get("vllm:prefix_cache_queries_total", 0.0)
     h = out.get("vllm:prefix_cache_hits_total", 0.0)
     if q > 0:
