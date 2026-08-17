@@ -1,8 +1,5 @@
 # SparkDash
 
-<img width="1207" height="840" alt="Overview" src="https://github.com/user-attachments/assets/b7f2c4c5-c1b3-419a-9e4f-b642e81e9ffc" />
-
-
 A monitoring **and control** dashboard for a [sparkrun](https://sparkrun.dev)
 DGX Spark cluster. It reports the Ray cluster, the vLLM instance, the running
 recipe / loaded model, and per-node vitals (CPU, RAM, VRAM, GPU, storage); and,

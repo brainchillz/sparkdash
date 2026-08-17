@@ -40,6 +40,7 @@ class Hub:
         self._monitor: dict[str, dict] = {}      # node name -> monitor frame
         self._monitor_ts: dict[str, float] = {}  # node name -> monotonic frame time
         self._probe: dict[str, dict] = {}         # node name -> {vram_mib,disk_used,disk_total}
+        self._probe_ts: dict[str, float] = {}     # node name -> monotonic probe time
         self._ray: dict[str, Any] = {"reachable": False}
         self._vllm: dict[str, Any] = {"reachable": False}
         self._vllm_fails = 0
@@ -116,11 +117,22 @@ class Hub:
                     except json.JSONDecodeError:
                         continue
                     now = time.monotonic()
-                    for ip, data in frame.get("hosts", {}).items():
+                    hosts = frame.get("hosts", {})
+                    # sparkrun <= 0.2.x keys "hosts" by IP; 0.3.x emits a
+                    # list of {"host": ip, "sample": {...}, ...} entries.
+                    if isinstance(hosts, list):
+                        pairs = [
+                            (h.get("host"), h.get("sample"))
+                            for h in hosts if isinstance(h, dict)
+                        ]
+                    else:
+                        pairs = hosts.items()
+                    for ip, data in pairs:
                         # Placeholder frames ({"connecting": true} /
                         # {"error": ...}) carry no metrics; storing them
                         # would render as an online node with blank stats.
-                        if not isinstance(data, dict) or "hostname" not in data:
+                        if not ip or not isinstance(data, dict) \
+                                or "hostname" not in data:
                             continue
                         name = config.IP_TO_NODE.get(ip, ip)
                         self._monitor[name] = data
@@ -169,6 +181,7 @@ class Hub:
                 "disk_used": int(used or 0),
                 "disk_total": int(total or 0),
             }
+            self._probe_ts[node["name"]] = time.monotonic()
         except ValueError:
             self._note_error("probe_parse", ValueError(f"bad probe output: {text!r}"))
 
@@ -267,6 +280,8 @@ class Hub:
             if now - self._monitor_ts.get(n["name"], 0.0) > config.MONITOR_STALE:
                 mon = {}
             probe = self._probe.get(n["name"], {})
+            if now - self._probe_ts.get(n["name"], 0.0) > config.PROBE_STALE:
+                probe = {}
             nodes.append({
                 "name": n["name"],
                 "ip": n["ip"],
@@ -369,13 +384,17 @@ def _parse_vllm_metrics(text: str) -> dict[str, float]:
 
 # Header line. Cluster jobs: "Job: minimax-2.7  (tp=2)  [e6b6dfeb53aa]  (2 container(s))"
 # Solo jobs (newer sparkrun): "Job: @official/foo-vllm  (tp=1, pp=1)  [d6b0...]  (1 container(s))"
+# Newer sparkrun uses composite ids with an underscore, e.g. [50294067b4ab6802_462aafd285e6].
 _JOB_RE = re.compile(
-    r"Job:\s+(?P<name>\S+)\s+\(tp=(?P<tp>\d+)(?:,\s*pp=(?P<pp>\d+))?\)\s+\[(?P<id>[0-9a-f]+)\]"
+    r"Job:\s+(?P<name>\S+)\s+\(tp=(?P<tp>\d+)(?:,\s*pp=(?P<pp>\d+))?\)\s+\[(?P<id>[0-9a-f_]+)\]"
 )
 # Container line, e.g.: "  head  <host>  Up 5 days  vllm-node-xxxxx"
 # Single-node jobs report role "solo".
+# sparkrun 0.3.x cluster jobs print roles node_0/node_1/... instead of
+# head/worker; missing them empties the container list, which downstream
+# reads as a solo job — and a "solo" restart of a tp=2 recipe crashes vLLM.
 _CONT_RE = re.compile(
-    r"^\s+(head|worker|solo)\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<status>Up[^\n]*?)\s{2,}\S+\s*$"
+    r"^\s+(head|worker|solo|node_\d+)\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<status>Up[^\n]*?)\s{2,}\S+\s*$"
 )
 
 
