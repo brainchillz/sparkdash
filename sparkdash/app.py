@@ -11,11 +11,12 @@ import asyncio
 import contextlib
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import (FileResponse, JSONResponse, PlainTextResponse,
+                               RedirectResponse)
 from fastapi.staticfiles import StaticFiles
 
-from . import config, history, logstream, store
+from . import alerts, auth, config, history, logstream, sso, store
 from .admin_api import router as admin_router
 from .collectors import Hub
 from .metrics import render_prometheus
@@ -30,22 +31,24 @@ hub = Hub()
 clients: set[WebSocket] = set()
 _broadcaster: asyncio.Task | None = None
 _sampler: asyncio.Task | None = None
+_alerter: asyncio.Task | None = None
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _broadcaster, _sampler
+    global _broadcaster, _sampler, _alerter
     store.init_db()
     store.purge_expired_sessions()
     history.init_db()
     hub.start()
     _broadcaster = asyncio.create_task(_broadcast_loop())
     _sampler = asyncio.create_task(history.sampler_loop(hub))
+    _alerter = asyncio.create_task(alerts.watch(hub))
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    for task in (_broadcaster, _sampler):
+    for task in (_broadcaster, _sampler, _alerter):
         if task:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -168,6 +171,38 @@ async def logs_ws(ws: WebSocket) -> None:
         # request task itself is being cancelled (e.g. server shutdown).
         with contextlib.suppress(Exception):
             await asyncio.shield(logstream.stop_stream(stream))
+
+
+@app.post("/api/admin/canary", dependencies=[auth.AdminDep])
+async def run_canary() -> JSONResponse:
+    """A real (tiny) chat completion against the loaded model: TTFT, decode
+    rate, and a coherence check. The truth `/health` can't tell."""
+    return JSONResponse(await hub.run_canary())
+
+
+@app.get("/sso/callback")
+async def sso_callback(request: Request) -> Response:
+    """Exchange a signed Nexus SSO assertion for an ordinary local session.
+
+    The ONLY place an assertion is accepted — never as a bearer credential,
+    so no API endpoint gains a new way in and API tokens are untouched.
+    Registered unconditionally so a UI enrollment applies without a restart;
+    unconfigured it behaves as though it were not here.
+    """
+    if not sso.enabled():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    sub = sso.verify(request.query_params.get("a"))
+    dest = sso.safe_next(request.query_params.get("next"))
+    if not sub:
+        return RedirectResponse("/admin?sso_error=1", status_code=302)
+    # The subject must be this install's one admin account. An assertion
+    # proves WHO the caller is, never authority to create an account.
+    admin = store.get_admin()
+    if not admin or sub != admin["username"]:
+        return RedirectResponse("/admin?sso_error=unknown_user", status_code=302)
+    resp = RedirectResponse(dest, status_code=302)
+    auth.open_session(resp)
+    return resp
 
 
 @app.get("/")

@@ -19,18 +19,23 @@ import asyncio
 import json
 import re
 import time
+from collections import deque
 from typing import Any
 
 import httpx
 
 from . import config
 
-# Remote one-shot probe: sum per-process VRAM (MiB) and read root fs used/total
-# bytes. Emitted as "<vram_mib>|<used_bytes>,<total_bytes>".
+# Remote one-shot probe: sum per-process VRAM (MiB), read root fs used/total
+# bytes, and list sparkrun containers (for orphan detection — a container
+# sparkrun no longer tracks still squats the port and unified memory).
+# Emitted as "<vram_mib>|<used_bytes>,<total_bytes>|<name,name,...>".
 _PROBE_CMD = (
     "V=$(nvidia-smi --query-compute-apps=used_gpu_memory "
     "--format=csv,noheader,nounits 2>/dev/null | awk '{s+=$1} END{print s+0}'); "
-    "D=$(df -B1 / | awk 'NR==2{print $3\",\"$2}'); echo \"$V|$D\""
+    "D=$(df -B1 / | awk 'NR==2{print $3\",\"$2}'); "
+    "C=$(docker ps --format '{{.Names}}' 2>/dev/null | grep '^sparkrun_' "
+    "| paste -sd, -); echo \"$V|$D|$C\""
 )
 
 
@@ -47,6 +52,12 @@ class Hub:
         self._recipe: dict[str, Any] = {"running": False}
         self._client = httpx.AsyncClient(timeout=4.0)
         self._tasks: list[asyncio.Task] = []
+        # Recent collector failures, surfaced in the snapshot so a broken
+        # feed is visible on the page instead of only in the journal.
+        self._errors: deque[dict] = deque(maxlen=50)
+        self._sparkrun_version = ""
+        self._canary: dict[str, Any] = {}        # last canary result (see canary())
+        self._peers: dict[str, dict] = {}        # peer name -> condensed snapshot
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -57,13 +68,24 @@ class Hub:
             asyncio.create_task(self._loop(self._poll_ray, config.SLOW_POLL)),
             asyncio.create_task(self._loop(self._poll_vllm, config.SLOW_POLL)),
             asyncio.create_task(self._loop(self._poll_status, config.STATUS_POLL)),
+            # sparkrun version changes only on `sparkrun update`, but that can
+            # happen underneath a running dashboard — refresh occasionally.
+            asyncio.create_task(self._loop(self._poll_version, 600.0)),
         ]
+        if config.PEERS:
+            self._tasks.append(asyncio.create_task(
+                self._loop(self._poll_peers, config.PEER_POLL)))
+        if config.CANARY_INTERVAL > 0:
+            self._tasks.append(asyncio.create_task(
+                self._loop(self.run_canary, config.CANARY_INTERVAL)))
 
     async def stop(self) -> None:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self._client.aclose()
+        if hasattr(self, "_peer_client"):
+            await self._peer_client.aclose()
 
     async def _loop(self, fn, interval: float) -> None:
         """Run an async collector forever, swallowing per-cycle errors."""
@@ -78,6 +100,21 @@ class Hub:
 
     def _note_error(self, where: str, exc: Exception) -> None:
         print(f"[sparkdash] {where}: {type(exc).__name__}: {exc}", flush=True)
+        self._errors.append({"ts": time.time(), "where": where,
+                             "error": f"{type(exc).__name__}: {exc}"})
+
+    def _failing_collectors(self, window: float = 120.0, threshold: int = 3) -> list[str]:
+        """Collectors with repeated recent failures — a feed that is down, not
+        a one-off hiccup. Returns human-readable summaries."""
+        cutoff = time.time() - window
+        counts: dict[str, dict] = {}
+        for e in self._errors:
+            if e["ts"] >= cutoff:
+                c = counts.setdefault(e["where"], {"n": 0, "last": ""})
+                c["n"] += 1
+                c["last"] = e["error"]
+        return [f"{where}: failing repeatedly ({c['n']}x in {int(window)}s — {c['last']})"
+                for where, c in sorted(counts.items()) if c["n"] >= threshold]
 
     # -- monitor stream (backbone) ----------------------------------------
 
@@ -172,14 +209,17 @@ class Hub:
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=8.0)
         text = out.decode(errors="replace").strip()
-        # Expected: "<vram_mib>|<used_bytes>,<total_bytes>"
+        # Expected: "<vram_mib>|<used_bytes>,<total_bytes>|<container,...>"
+        # (the container field is absent from pre-update probes — tolerate it).
         try:
-            vram_part, disk_part = text.split("|", 1)
+            vram_part, rest = text.split("|", 1)
+            disk_part, _, cont_part = rest.partition("|")
             used, total = disk_part.split(",", 1)
             self._probe[node["name"]] = {
                 "vram_used_mb": float(vram_part or 0),
                 "disk_used": int(used or 0),
                 "disk_total": int(total or 0),
+                "containers": [c for c in cont_part.split(",") if c],
             }
             self._probe_ts[node["name"]] = time.monotonic()
         except ValueError:
@@ -268,6 +308,100 @@ class Hub:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
         self._recipe = _parse_status(out.decode(errors="replace"))
 
+    # -- sparkrun version --------------------------------------------------
+
+    async def _poll_version(self) -> None:
+        proc = await asyncio.create_subprocess_exec(
+            "sparkrun", "--version",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        m = re.search(r"version\s+(\S+)", out.decode(errors="replace"))
+        if m:
+            self._sparkrun_version = m.group(1)
+
+    # -- peer installs -----------------------------------------------------
+
+    async def _poll_peers(self) -> None:
+        # Peers serve HTTPS with self-signed certs; nothing secret is read
+        # from them (the snapshot endpoint is public), so skip verification.
+        if not hasattr(self, "_peer_client"):
+            self._peer_client = httpx.AsyncClient(timeout=4.0, verify=False)
+
+        async def one(peer: dict) -> None:
+            try:
+                r = await self._peer_client.get(peer["url"] + "/api/v1/snapshot")
+                r.raise_for_status()
+                s = r.json()
+                self._peers[peer["name"]] = {
+                    "name": peer["name"], "url": peer["url"],
+                    "reachable": True,
+                    "healthy": bool(s.get("cluster_healthy")),
+                    "model": (s.get("vllm") or {}).get("model"),
+                    "node_count": s.get("node_count"),
+                    "ts": time.time(),
+                }
+            except Exception:
+                self._peers[peer["name"]] = {
+                    "name": peer["name"], "url": peer["url"],
+                    "reachable": False, "ts": time.time(),
+                }
+        await asyncio.gather(*(one(p) for p in config.PEERS))
+
+    # -- model canary ------------------------------------------------------
+
+    async def run_canary(self) -> dict:
+        """One real (tiny) chat completion: proves coherent output and
+        measures TTFT + decode rate. `/health` can't do either — vLLM binds
+        the port before loading, and a garbling model still serves 200s."""
+        result: dict[str, Any] = {"ts": time.time(), "ok": False}
+        model = self._vllm.get("model")
+        if not model:
+            result["error"] = "no model loaded"
+            self._canary = result
+            return result
+        body = {
+            "model": model,
+            "messages": [{"role": "user",
+                          "content": "Reply with exactly: CANARY OK"}],
+            "max_tokens": config.CANARY_MAX_TOKENS,
+            "stream": True,
+            "chat_template_kwargs": {"thinking": False},
+        }
+        text, t0, t_first = "", time.monotonic(), None
+        try:
+            async with self._client.stream(
+                    "POST", f"{config.VLLM_BASE}/v1/chat/completions",
+                    json=body, timeout=60.0) as r:
+                r.raise_for_status()
+                async for line in r.aiter_lines():
+                    if not line.startswith("data: ") or line == "data: [DONE]":
+                        continue
+                    try:
+                        delta = (json.loads(line[6:])["choices"][0]
+                                 .get("delta", {}).get("content") or "")
+                    except (json.JSONDecodeError, LookupError):
+                        continue
+                    if delta and t_first is None:
+                        t_first = time.monotonic()
+                    text += delta
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            self._canary = result
+            return result
+        wall = time.monotonic() - t0
+        result.update({
+            "model": model,
+            "reply": text.strip()[:120],
+            "coherent": "CANARY OK" in text,
+            "ttft_s": round(t_first - t0, 3) if t_first else None,
+            "wall_s": round(wall, 2),
+        })
+        result["ok"] = bool(result["coherent"])
+        if not result["ok"]:
+            result["error"] = "reply did not contain the expected text"
+        self._canary = result
+        return result
+
     # -- merged snapshot ---------------------------------------------------
 
     def snapshot(self) -> dict:
@@ -282,6 +416,12 @@ class Hub:
             probe = self._probe.get(n["name"], {})
             if now - self._probe_ts.get(n["name"], 0.0) > config.PROBE_STALE:
                 probe = {}
+            # Containers on this node that don't belong to the current job:
+            # old-version leftovers sparkrun no longer tracks, squatting the
+            # port and unified memory.
+            rid = self._recipe.get("id") or ""
+            orphans = [c for c in probe.get("containers", [])
+                       if not (rid and rid in c)]
             nodes.append({
                 "name": n["name"],
                 "ip": n["ip"],
@@ -307,6 +447,7 @@ class Hub:
                 "vram_used_mb": probe.get("vram_used_mb"),
                 "disk_used": probe.get("disk_used"),
                 "disk_total": probe.get("disk_total"),
+                "orphan_containers": orphans,
             })
 
         # Healthy = all configured nodes reporting and vLLM serving. Ray is only
@@ -319,14 +460,48 @@ class Hub:
             and all(nd["online"] for nd in nodes)
             and ray_ok
         )
+
+        # WHY unhealthy — every component of the verdict, in plain words, so
+        # "degraded" is never a puzzle that needs SSH and journalctl to solve.
+        reasons: list[str] = []
+        if not self._vllm.get("reachable"):
+            reasons.append("vLLM API unreachable")
+        elif not self._vllm.get("healthy"):
+            reasons.append("vLLM reachable but /health failing")
+        for nd in nodes:
+            if not nd["online"]:
+                age = now - self._monitor_ts.get(nd["name"], 0.0)
+                reasons.append(
+                    f"node {nd['name']}: no monitor data"
+                    + (f" for {int(age)}s" if self._monitor_ts.get(nd["name"]) else " yet"))
+        if not ray_ok:
+            reasons.append(f"Ray: {self._ray.get('nodes_alive')}/"
+                           f"{self._ray.get('nodes_total')} nodes alive")
+
+        # Non-fatal but worth a banner: failing collectors, orphan containers,
+        # a canary that last failed.
+        warnings = self._failing_collectors()
+        for nd in nodes:
+            for c in nd["orphan_containers"]:
+                warnings.append(f"node {nd['name']}: orphan container {c}")
+        if self._canary and not self._canary.get("ok"):
+            warnings.append("model canary failed: "
+                            + str(self._canary.get("error", "incoherent reply")))
+
         return {
             "ts": time.time(),
             "cluster_healthy": bool(cluster_healthy),
+            "health_reasons": reasons,
+            "warnings": warnings,
             "node_count": len(nodes),
+            "sparkrun_version": self._sparkrun_version,
             "ray": self._ray,
             "vllm": self._vllm,
             "recipe": self._recipe,
             "nodes": nodes,
+            "canary": self._canary,
+            "peers": sorted(self._peers.values(), key=lambda p: p["name"]),
+            "errors_recent": list(self._errors)[-10:],
         }
 
 

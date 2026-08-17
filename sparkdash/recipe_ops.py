@@ -97,6 +97,30 @@ def _mode_flags(mode: str) -> list[str]:
     return ["--cluster", config.SPARKRUN_CLUSTER]
 
 
+def _guard_mode(recipe: str, mode: str) -> tuple[str, str | None]:
+    """Refuse to run a multi-node recipe --solo.
+
+    When `recipe` is a readable file declaring `cluster_only: true` or
+    `min_nodes` > 1, a requested solo mode is overridden to cluster and the
+    reason is returned for the operation log. The recipe's own declaration is
+    checked with regexes on purpose — no YAML dependency.
+    """
+    if mode != "solo":
+        return mode, None
+    try:
+        with open(recipe, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(65536)
+    except OSError:
+        return mode, None
+    if re.search(r"^cluster_only:\s*true\b", text, re.M):
+        return "cluster", f"{recipe} declares cluster_only — running on the cluster"
+    m = re.search(r"^min_nodes:\s*(\d+)", text, re.M)
+    if m and int(m.group(1)) > 1:
+        return "cluster", (f"{recipe} declares min_nodes: {m.group(1)} — "
+                           "running on the cluster")
+    return mode, None
+
+
 async def current_recipe() -> dict:
     """Parse `sparkrun status` into the running recipe (id, name, mode)."""
     proc = await asyncio.create_subprocess_exec(
@@ -107,7 +131,10 @@ async def current_recipe() -> dict:
     if rec.get("running"):
         # sparkrun labels single-node jobs with role "solo"; fall back to the
         # container count for older versions that only print head/worker.
-        solo = rec.get("solo") or len(rec.get("containers", [])) <= 1
+        # ZERO parsed containers is a parse failure, not a solo job — calling
+        # it solo once relaunched a tp=2 cluster recipe --solo and crashed
+        # vLLM (2 workers, 1 GPU), so the unknown case defaults to cluster.
+        solo = rec.get("solo") or len(rec.get("containers", [])) == 1
         rec["mode"] = "solo" if solo else "cluster"
     return rec
 
@@ -226,6 +253,9 @@ class RecipeController:
 
     async def _do_start(self, recipe: str, mode: str) -> None:
         try:
+            mode, note = _guard_mode(recipe, mode)
+            if note:
+                self._emit(f"[sparkdash] {note}")
             self._touch(phase="launching", message=f"Starting {recipe} ({mode})")
             rc = await self._stream(
                 ["sparkrun", "run", recipe, *_mode_flags(mode), "--no-follow"])
@@ -310,6 +340,9 @@ class RecipeController:
                 return
 
             self._touch(phase="launching", message="Re-launching recipe")
+            use_mode, note = _guard_mode(tmp, use_mode)
+            if note:
+                self._emit(f"[sparkdash] {note}")
             rc = await self._stream(
                 ["sparkrun", "run", tmp, *_mode_flags(use_mode), "--no-follow"])
             if rc != 0:

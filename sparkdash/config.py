@@ -121,6 +121,43 @@ _cert = _cfg.get("cert", {})
 CERT_HOSTNAMES = _cert.get("hostnames", ["localhost"])
 CERT_IPS = _cert.get("ips", ["127.0.0.1"])
 
+# -- Single sign-on (Nexus SSO relying party) -----------------------------
+#
+# The [sso] table in config.toml is the install-time tier (issuer, pubkey,
+# kid, audience, auto_redirect); SPARKDASH_SSO_* env vars override it, and a
+# UI enrollment (sso.json in the data dir) is the fallback. See sso.py.
+SSO_TOML = _cfg.get("sso", {})
+
+# -- Alerting -------------------------------------------------------------
+#
+# POSTs a short message on cluster state transitions (healthy <-> degraded,
+# model changes, node offline). `webhook_url` receives JSON {title, message,
+# ts}; with style = "ntfy" the message is sent as a plain-text body with a
+# Title header instead, which is what ntfy.sh-compatible servers expect.
+_alerts = _cfg.get("alerts", {})
+ALERT_WEBHOOK = _alerts.get("webhook_url", "")
+ALERT_STYLE = _alerts.get("style", "json")          # "json" | "ntfy"
+
+# -- Peer installs --------------------------------------------------------
+#
+# Other SparkDash installs to summarise on the front page. Each: name, url
+# (base URL, e.g. "https://pebbles.example:7862"). Read-only; their public
+# snapshot endpoint is polled at PEER_POLL.
+PEERS = [
+    {"name": p.get("name", p.get("url", "?")), "url": p["url"].rstrip("/")}
+    for p in _cfg.get("peers", []) if p.get("url")
+]
+PEER_POLL = 15.0
+
+# -- Model canary ---------------------------------------------------------
+#
+# A one-token-budget real chat completion that proves the model produces
+# coherent output ("/health returns 200" is not that — vLLM binds the port
+# before loading, and a garbling model serves 200s). Run from the admin UI;
+# set canary_interval > 0 (seconds) to also run it on a timer.
+CANARY_INTERVAL = float(_cfg.get("canary_interval", 0) or 0)
+CANARY_MAX_TOKENS = 32
+
 # -- Model preload --------------------------------------------------------
 
 # sparkrun is installed as a separate uv tool; we call its model download /

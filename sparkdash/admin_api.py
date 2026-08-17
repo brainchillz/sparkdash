@@ -21,7 +21,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from . import auth, backup, certs, chat, config, hf, recipe_ops, store
+from . import auth, backup, certs, chat, config, hf, recipe_ops, sso, store
 
 router = APIRouter()
 
@@ -120,7 +120,56 @@ async def me(request: Request) -> dict:
         "authenticated": authed,
         "username": admin["username"] if authed and admin else None,
         "admin_configured": admin is not None,
+        # Public SSO hint (issuer + audience only) so the login box can offer
+        # "Sign in with Nexus SSO"; null when SSO is not configured.
+        "sso": sso.login_hint(),
     }
+
+
+# -- single sign-on (settings surface; the callback lives in app.py) ---------
+
+class SsoEnrollBody(BaseModel):
+    issuer: str
+    code: str
+
+
+@router.get("/api/admin/sso", dependencies=[auth.SessionDep])
+async def sso_status() -> dict:
+    cfg = sso.get_config()
+    return {
+        "enabled": sso.enabled(),
+        "locked": sso.locked(),
+        "config": {k: cfg[k] for k in
+                   ("issuer", "audience", "kid", "source")} if cfg else None,
+    }
+
+
+@router.post("/api/admin/sso/enroll", dependencies=[auth.SessionDep])
+async def sso_enroll(body: SsoEnrollBody, request: Request) -> dict:
+    if sso.locked():
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "SSO is fixed by host configuration")
+    issuer = body.issuer.strip().rstrip("/")
+    if not issuer.startswith("https://"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "Issuer must be an https:// URL")
+    callback = str(request.base_url).rstrip("/") + "/sso/callback"
+    result, err = await asyncio.to_thread(
+        sso.redeem, issuer, body.code.strip(), callback)
+    if err:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, err)
+    sso.save_stored(result["issuer"], result["key"],
+                    result.get("kid", ""), result["audience"])
+    return {"ok": True, "config": {"issuer": result["issuer"],
+                                   "audience": result["audience"]}}
+
+
+@router.delete("/api/admin/sso", dependencies=[auth.SessionDep])
+async def sso_disable() -> dict:
+    if sso.locked():
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "SSO is fixed by host configuration")
+    return {"ok": True, "removed": sso.clear_stored()}
 
 
 # -- API tokens --------------------------------------------------------------

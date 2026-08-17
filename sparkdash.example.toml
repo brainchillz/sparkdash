@@ -35,3 +35,30 @@ local = false
 [cert]
 hostnames = ["localhost"]
 ips       = ["127.0.0.1"]
+
+# Optional: run the model canary (a real tiny chat completion with a
+# coherence check) on a timer, seconds. 0 or absent = manual only (admin UI).
+#canary_interval = 900
+
+# Optional: single sign-on against a Nexus SSO issuer. Setting this here
+# fixes the decision at install time (the admin UI can only report it);
+# leaving it out lets an admin enroll from Settings with a one-time code.
+# The local password login always keeps working.
+#[sso]
+#issuer   = "https://sso.example.net"
+#pubkey   = "<base64url Ed25519 public key from the issuer's /sso/jwks>"
+#kid      = "<key id from /sso/jwks>"
+#audience = "<the id this install was registered under at the issuer>"
+#auto_redirect = false
+
+# Optional: POST a short message on state transitions (healthy <-> degraded,
+# model changed, node offline). style = "json" posts {title, message, ts};
+# style = "ntfy" posts a plain-text body with a Title header.
+#[alerts]
+#webhook_url = "https://ntfy.example.net/sparkdash"
+#style       = "ntfy"
+
+# Optional: other SparkDash installs to summarise on the front page.
+#[[peers]]
+#name = "pebbless"
+#url  = "https://pebbles.example.net:7862"

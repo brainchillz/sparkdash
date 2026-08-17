@@ -19,6 +19,8 @@
 </header>
 
 <main>
+  <div id="health-strip" style="display:none"></div>
+  <div id="peers-strip" class="chips" style="display:none; margin-bottom:14px"></div>
   <div class="grid top">
     <div class="card" id="recipe-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px">
@@ -41,7 +43,7 @@
   <div class="grid nodes" id="nodes"></div>
 </main>
 
-<footer>SparkDash &middot; polling every 2s</footer>
+<footer>SparkDash &middot; polling every 2s<span id="foot-version"></span></footer>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -122,9 +124,9 @@ function renderRay(ray, vllm, recipe, nodeCount) {
              `<span class="v">${n.cpu ?? "—"} CPU · ${n.gpu ?? "—"} GPU · ${fmtBytes(n.memory_bytes)}</span></div>`;
     }).join("");
     html = kv("Nodes alive", `${ray.nodes_alive}/${ray.nodes_total}`) + nodes;
-  } else if (!solo) {
-    html = `<span class="meta">Ray dashboard unreachable.</span>`;
   }
+  // No "unreachable" placeholder: sparkrun 0.3.x dropped Ray entirely, so an
+  // absent dashboard is the normal state — the card is pure vLLM status then.
   $("ray-title").textContent = html ? "Ray Cluster" : "vLLM";
   // vLLM health also surfaces here as a quick line (the whole card, when solo).
   const sep = html ? "margin-top:10px;border-top:1px solid var(--border);padding-top:10px" : "";
@@ -266,6 +268,39 @@ function render(snap) {
   renderRay(snap.ray, snap.vllm, snap.recipe, snap.node_count);
   renderVllm(snap.vllm, snap.recipe);
   renderNodes(snap.nodes);
+  renderHealthStrip(snap);
+  renderPeers(snap.peers);
+  $("foot-version").textContent =
+    snap.sparkrun_version ? ` · sparkrun ${snap.sparkrun_version}` : "";
+}
+
+// Why "Degraded" — plus non-fatal warnings (failing collectors, orphan
+// containers, canary failures). The page explains itself; no journalctl.
+function renderHealthStrip(snap) {
+  const reasons = snap.health_reasons || [];
+  const warns = snap.warnings || [];
+  const el = $("health-strip");
+  if (!reasons.length && !warns.length) { el.style.display = "none"; el.innerHTML = ""; return; }
+  const line = (cls, icon, text) =>
+    `<div class="health-line ${cls}">${icon} ${text}</div>`;
+  el.innerHTML =
+    reasons.map(r => line("bad", "●", r)).join("") +
+    warns.map(w => line("warn", "▲", w)).join("");
+  el.style.display = "";
+}
+
+function renderPeers(peers) {
+  const el = $("peers-strip");
+  if (!peers || !peers.length) { el.style.display = "none"; return; }
+  el.innerHTML = peers.map(p => {
+    const d = !p.reachable ? "bad" : (p.healthy ? "ok" : "warn");
+    const label = !p.reachable ? "unreachable" : (p.healthy ? "healthy" : "degraded");
+    const model = p.model ? ` · ${p.model.split("/").pop()}` : "";
+    return `<a class="chip" href="${p.url}" target="_blank" rel="noopener">` +
+      `<span class="dot ${d}" style="display:inline-block;margin-right:6px"></span>` +
+      `${p.name} · ${label}${model}</a>`;
+  }).join("");
+  el.style.display = "";
 }
 
 // -- WebSocket with auto-reconnect ---------------------------------------

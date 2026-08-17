@@ -30,6 +30,7 @@
            placeholder="password" onkeydown="if(event.key==='Enter')doLogin()">
     <div class="err" id="login-err"></div>
     <div class="row" style="margin-top:6px; justify-content:flex-end">
+      <button class="btn" id="sso-login-btn" style="display:none" onclick="doSsoLogin()">Sign in with Nexus SSO</button>
       <button class="btn primary" id="login-btn" onclick="doLogin()">Sign in</button>
     </div>
   </div>
@@ -154,6 +155,14 @@
         <button class="btn danger" id="chat-stop" onclick="chatStop()" style="display:none">Stop</button>
       </div>
     </div>
+    <div class="card">
+      <h2>Model Canary</h2>
+      <p class="meta">One real (tiny) chat completion: time-to-first-token, wall time, and
+        a coherence check. <code>/health</code> can't tell you any of that — vLLM binds the
+        port before loading, and a garbling model still serves 200s.</p>
+      <button class="btn" id="canary-btn" onclick="runCanary()">Run canary</button>
+      <div id="canary-result" class="meta" style="margin-top:10px"></div>
+    </div>
     </div><!-- /tab-chat -->
 
     <div class="tabpanel" id="tab-settings">
@@ -191,6 +200,27 @@
       </label>
       <div class="meta" id="notif-status" style="margin-top:8px"></div>
     </div>
+
+    <div class="card">
+      <h2>Single Sign-On</h2>
+      <p class="meta">Sign in through a Nexus SSO issuer instead of the local password.
+        The local password always keeps working — an issuer outage must never lock this
+        install out of its own UI.</p>
+      <div id="sso-status" class="meta">loading…</div>
+      <div id="sso-enroll-form" style="display:none; margin-top:10px">
+        <label>Issuer URL</label>
+        <input id="sso-issuer" placeholder="https://sso.example.net">
+        <label>Enrollment code <span class="meta">(minted at the issuer, single-use)</span></label>
+        <input id="sso-code" placeholder="code">
+        <div class="err" id="sso-err"></div>
+        <div class="row" style="margin-top:6px">
+          <button class="btn primary" onclick="ssoEnroll()">Enroll</button>
+        </div>
+      </div>
+      <div class="row" id="sso-disable-row" style="display:none; margin-top:10px">
+        <button class="btn danger" onclick="ssoDisable()">Disable SSO</button>
+      </div>
+    </div>
     </div><!-- /tab-settings -->
 
   </div>
@@ -209,6 +239,7 @@ function fmtBytes(b) {
 }
 
 // -- session state -------------------------------------------------------
+let _ssoHint = null;
 function showLogin(me) {
   $("admin-content").style.display = "none";
   $("login-card").style.display = "";
@@ -220,7 +251,79 @@ function showLogin(me) {
     $("login-hint").innerHTML = `No admin configured yet. Set one on the host:<br>` +
       `<code>python -m sparkdash.admin set-password</code>`;
   }
+  _ssoHint = me && me.sso;
+  const ssoErr = new URLSearchParams(location.search).get("sso_error");
+  if (ssoErr) {
+    $("login-err").textContent = ssoErr === "unknown_user"
+      ? "SSO subject has no account on this install."
+      : "SSO sign-in failed — assertion rejected.";
+  }
+  if (_ssoHint) {
+    $("sso-login-btn").style.display = "";
+    // auto_redirect sends unauthenticated browsers straight to the issuer —
+    // but never after an SSO failure, or the page would redirect-loop.
+    if (_ssoHint.auto_redirect && !ssoErr) { doSsoLogin(); return; }
+  } else {
+    $("sso-login-btn").style.display = "none";
+  }
   setTimeout(()=>$("login-user").focus(), 50);
+}
+
+function doSsoLogin() {
+  if (!_ssoHint) return;
+  const q = new URLSearchParams({aud: _ssoHint.audience, next: "/admin"});
+  location.href = _ssoHint.issuer + "/sso/authorize?" + q;
+}
+
+// -- SSO settings ---------------------------------------------------------
+async function refreshSso() {
+  try {
+    const s = await api("/api/admin/sso");
+    if (s.enabled) {
+      const c = s.config || {};
+      $("sso-status").innerHTML =
+        `Enabled — issuer <b>${c.issuer}</b>, audience <b>${c.audience}</b>` +
+        ` <span class="meta">(${c.source === "stored" ? "enrolled via UI" : "fixed by host config"})</span>`;
+      $("sso-enroll-form").style.display = "none";
+      $("sso-disable-row").style.display = s.locked ? "none" : "";
+    } else {
+      $("sso-status").textContent = s.locked
+        ? "Disabled by host configuration."
+        : "Not configured.";
+      $("sso-enroll-form").style.display = s.locked ? "none" : "";
+      $("sso-disable-row").style.display = "none";
+    }
+  } catch(e) { $("sso-status").textContent = e.message; }
+}
+async function ssoEnroll() {
+  $("sso-err").textContent = "";
+  try {
+    await api("/api/admin/sso/enroll", {method:"POST",
+      headers:{"content-type":"application/json"},
+      body: JSON.stringify({issuer:$("sso-issuer").value.trim(), code:$("sso-code").value.trim()})});
+    $("sso-code").value = "";
+    refreshSso();
+  } catch(e){ $("sso-err").textContent = e.message; }
+}
+async function ssoDisable() {
+  if (!confirm("Disable SSO sign-in for this install?")) return;
+  try { await api("/api/admin/sso", {method:"DELETE"}); refreshSso(); }
+  catch(e){ $("sso-status").textContent = e.message; }
+}
+
+// -- model canary ---------------------------------------------------------
+async function runCanary() {
+  const btn = $("canary-btn"), out = $("canary-result");
+  btn.disabled = true; out.textContent = "running…";
+  try {
+    const r = await api("/api/admin/canary", {method:"POST"});
+    out.innerHTML = r.ok
+      ? `<span style="color:var(--ok)">✓ coherent</span> — TTFT <b>${r.ttft_s}s</b>, ` +
+        `wall <b>${r.wall_s}s</b> <span class="meta">· reply: "${r.reply}"</span>`
+      : `<span style="color:var(--bad)">✗ ${r.error || "failed"}</span>` +
+        (r.reply ? ` <span class="meta">· reply: "${r.reply}"</span>` : "");
+  } catch(e) { out.textContent = e.message; }
+  btn.disabled = false;
 }
 function showContent(user) {
   $("login-card").style.display = "none";
@@ -228,6 +331,7 @@ function showContent(user) {
   $("logout-btn").style.display = "";
   $("whoami").textContent = "signed in as " + user;
   initNotifications();
+  refreshSso();
   applyTopology().then(() => {
     // Background pollers run regardless of the active tab (so notifications fire).
     pollOp(); pollJob(); pollBackupJob();
