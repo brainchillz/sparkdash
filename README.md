@@ -105,6 +105,27 @@ hostnames = ["localhost"]
 ips       = ["127.0.0.1"]
 ```
 
+Optional blocks (all documented in `sparkdash.example.toml`):
+
+```toml
+canary_interval = 900          # run the model canary every 15 min (0 = manual only)
+
+[sso]                          # single sign-on — see "Single sign-on" below
+issuer   = "https://sso.example.net"
+pubkey   = "<from the issuer's /sso/jwks>"
+kid      = "<from /sso/jwks>"
+audience = "sparkdash-mynode"
+#subject = "admin"             # issuer identity that signs in as the local admin
+
+[alerts]                       # POST on state transitions (degraded, model change,
+webhook_url = "https://ntfy.example.net/sparkdash"   # node offline)
+style       = "ntfy"           # "ntfy" (Title header + text body) or "json"
+
+[[peers]]                      # other SparkDash installs summarised on the front page
+name = "othernode"
+url  = "https://othernode.example:7862"
+```
+
 Notes:
 - **`ip` must match the monitor stream** — SparkDash maps `sparkrun cluster
   monitor` output back to nodes by this address; a mismatch leaves that node's
@@ -208,11 +229,60 @@ The split is deliberate: an API token can drive *operational* writes but
 *administration* requires an interactive session, so a leaked token can't
 escalate into managing the system. Passwords are scrypt-hashed; tokens are
 stored only as SHA-256 digests (shown once at creation). State lives in
-`~/.local/share/sparkdash/sparkdash.db`, outside the repo.
+`/var/lib/sparkdash/sparkdash.db` on installed deployments
+(`~/.local/share/sparkdash/` is the dev fallback), outside the repo.
+
+### Single sign-on (optional)
+
+SparkDash can act as a relying party for a **Nexus SSO** issuer: the login
+page gains a "Sign in with Nexus SSO" button that bounces the browser through
+the issuer and back to `/sso/callback`, where a signed, single-use Ed25519
+assertion (≤120 s) is exchanged for an ordinary session cookie. Past that
+point nothing can tell an SSO session from a password one — and the local
+password login **always keeps working**, so an issuer outage can never lock
+the install out of its own UI. API tokens are untouched; assertions are never
+accepted as bearer credentials.
+
+Setup needs both halves of a mutual registration:
+
+1. **At the issuer**, register this install (pick an audience id):
+
+   ```bash
+   python app.py add-app sparkdash-mynode https://mynode.example:7862/sso/callback
+   python app.py show-key      # prints the issuer URL, public key, and kid
+   ```
+
+2. **On this install**, either of:
+   - **Fixed at install time** — put an `[sso]` block in
+     `/etc/sparkdash/config.toml` (see Configuration above) with the issuer
+     URL, public key, and kid from `show-key` and the audience id you
+     registered, then `sudo systemctl restart sparkdash`. The admin UI can
+     then only report the config, not change it. (`SPARKDASH_SSO_*`
+     environment variables work the same way and override the file.)
+   - **Enrolled from the UI** — leave the config file alone, mint a one-time
+     enrollment code at the issuer, and redeem it in **Admin → Settings →
+     Single Sign-On**. The result is stored in `/var/lib/sparkdash/sso.json`
+     and survives updates; it can be disabled from the same panel.
+
+Notes:
+
+- **Exactly one subject is accepted.** By default it must equal the local
+  admin username. If your fleet identity differs (say the issuer account is
+  `admin` but the local account is `sparkadmin`), set `subject = "admin"` —
+  the mapping still only unlocks the account that already exists; SSO never
+  creates accounts or grants roles.
+- Verification is **stdlib-only** (`sparkdash/ed25519.py`, verify-only,
+  copied verbatim from the issuer project) — no new dependencies. The
+  algorithm is pinned to `EdDSA`, the audience and issuer are compared
+  exactly, assertions are single-use (replay cache), and a caller-supplied
+  `next` path is reduced to a same-site path.
+- Half-configured SSO behaves as if it were off rather than failing at
+  login time; with no issuer configured the callback route answers 404 and
+  the install is byte-identical in behaviour to a pre-SSO one.
 
 ### Certificate
 
-HTTPS is served from `~/.local/share/sparkdash/certs/`. On first run a
+HTTPS is served from `/var/lib/sparkdash/certs/`. On first run a
 self-signed cert (covering the node's hostnames/IPs) is generated. In the
 **Admin → TLS Certificate** panel you can paste your own PEM cert + key; it's
 validated (key matches cert, not expired, loads in OpenSSL) before install,
@@ -339,4 +409,19 @@ endpoints are `require_admin`. Endpoints: `GET /api/admin/recipe/current`,
   recipes are preserved and re-runnable
 - Live vLLM log viewer
 - Opt-in browser **notifications** (recipe ready, preload done, health changes)
+- **Self-explaining health**: the page states *why* it's degraded
+  (`health_reasons`) plus non-fatal warnings — repeatedly failing collectors,
+  **orphan containers** squatting memory, canary failures — instead of a bare
+  "Degraded" badge
+- **Model canary**: a real (tiny) chat completion with TTFT/wall measurements
+  and a coherence check, on demand or on a timer — `/health` can't tell a
+  bound port from a working model
+- Recipe **guard rails**: recipes declaring `cluster_only` / `min_nodes > 1`
+  refuse a `--solo` launch, and an unparseable container list never reads as
+  a solo job
+- Optional **webhook/ntfy alerting** on state transitions (degraded/recovered,
+  model changed, node offline), debounced
+- Optional **peers strip**: other SparkDash installs' health summarised up top
+- Optional **single sign-on** via a Nexus SSO issuer (the local password
+  always keeps working)
 - Single node or multi-node; no addresses baked into the source
