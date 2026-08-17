@@ -50,6 +50,7 @@ def _env_cfg() -> dict | None:
         "pubkey": os.environ.get("SPARKDASH_SSO_PUBKEY", ""),
         "kid": os.environ.get("SPARKDASH_SSO_KID", ""),
         "audience": os.environ.get("SPARKDASH_SSO_AUDIENCE", "") or _hostname(),
+        "subject": os.environ.get("SPARKDASH_SSO_SUBJECT", ""),
         "auto_redirect": os.environ.get("SPARKDASH_SSO_AUTO_REDIRECT", "") in
                          ("1", "true", "yes"),
         "source": "env",
@@ -65,6 +66,7 @@ def _toml_cfg() -> dict | None:
         "pubkey": str(t.get("pubkey", "")),
         "kid": str(t.get("kid", "")),
         "audience": str(t.get("audience", "")) or _hostname(),
+        "subject": str(t.get("subject", "")),
         "auto_redirect": bool(t.get("auto_redirect", False)),
         "source": "config",
     }
@@ -92,10 +94,28 @@ def get_config() -> dict | None:
             "pubkey": str(s["pubkey"]),
             "kid": str(s.get("kid") or ""),
             "audience": str(s.get("audience") or _hostname()),
+            "subject": str(s.get("subject") or ""),
             "auto_redirect": bool(s.get("auto_redirect")),
             "source": "stored",
         }
     return None
+
+
+def expected_subject() -> str:
+    """The one SSO subject this install signs in as its admin.
+
+    An explicit `subject` in the configuration wins — a single-account app
+    joining a fleet whose identity is e.g. "admin" maps that subject onto
+    its local account. Default: the local admin username itself. Either way
+    exactly ONE subject is accepted and it only ever unlocks the account
+    that already exists — no provisioning, no role grant.
+    """
+    cfg = get_config() or {}
+    if cfg.get("subject"):
+        return cfg["subject"]
+    from . import store
+    admin = store.get_admin()
+    return admin["username"] if admin else ""
 
 
 def locked() -> bool:

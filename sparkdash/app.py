@@ -195,10 +195,10 @@ async def sso_callback(request: Request) -> Response:
     dest = sso.safe_next(request.query_params.get("next"))
     if not sub:
         return RedirectResponse("/admin?sso_error=1", status_code=302)
-    # The subject must be this install's one admin account. An assertion
-    # proves WHO the caller is, never authority to create an account.
-    admin = store.get_admin()
-    if not admin or sub != admin["username"]:
+    # Exactly one subject is accepted (the configured mapping, or the local
+    # admin username) and it only unlocks the account that already exists.
+    expected = sso.expected_subject()
+    if not store.get_admin() or not expected or sub != expected:
         return RedirectResponse("/admin?sso_error=unknown_user", status_code=302)
     resp = RedirectResponse(dest, status_code=302)
     auth.open_session(resp)

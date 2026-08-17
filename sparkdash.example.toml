@@ -49,6 +49,10 @@ ips       = ["127.0.0.1"]
 #pubkey   = "<base64url Ed25519 public key from the issuer's /sso/jwks>"
 #kid      = "<key id from /sso/jwks>"
 #audience = "<the id this install was registered under at the issuer>"
+## Issuer subject that signs in as this install's admin account. Default:
+## the local admin username. Set when the fleet identity differs (e.g. the
+## issuer account is "admin" but SparkDash's local account is "sparkadmin").
+#subject  = "admin"
 #auto_redirect = false
 
 # Optional: POST a short message on state transitions (healthy <-> degraded,
