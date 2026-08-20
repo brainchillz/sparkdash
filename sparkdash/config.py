@@ -136,7 +136,7 @@ SSO_TOML = _cfg.get("sso", {})
 # Title header instead, which is what ntfy.sh-compatible servers expect.
 _alerts = _cfg.get("alerts", {})
 ALERT_WEBHOOK = _alerts.get("webhook_url", "")
-ALERT_STYLE = _alerts.get("style", "json")          # "json" | "ntfy"
+ALERT_STYLE = _alerts.get("style", "json")          # "json" | "ntfy" | "gchat"
 
 # -- Peer installs --------------------------------------------------------
 #

@@ -57,7 +57,10 @@ ips       = ["127.0.0.1"]
 
 # Optional: POST a short message on state transitions (healthy <-> degraded,
 # model changed, node offline). style = "json" posts {title, message, ts};
-# style = "ntfy" posts a plain-text body with a Title header.
+# style = "ntfy" posts a plain-text body with a Title header; style = "gchat"
+# posts {"text": ...} for a Google Chat space's incoming webhook.
+# Normally set from the admin UI (Settings -> Push Alerts); a block here
+# fixes it at install time and makes the UI read-only.
 #[alerts]
 #webhook_url = "https://ntfy.example.net/sparkdash"
 #style       = "ntfy"

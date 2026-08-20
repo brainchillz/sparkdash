@@ -149,6 +149,11 @@ def set_setting(key: str, value: str) -> None:
         )
 
 
+def delete_setting(key: str) -> bool:
+    with _conn() as c:
+        return c.execute("DELETE FROM settings WHERE key = ?", (key,)).rowcount > 0
+
+
 def find_active_token(token_hash: str) -> sqlite3.Row | None:
     with _conn() as c:
         row = c.execute(

@@ -119,7 +119,11 @@ audience = "sparkdash-mynode"
 
 [alerts]                       # POST on state transitions (degraded, model change,
 webhook_url = "https://ntfy.example.net/sparkdash"   # node offline)
-style       = "ntfy"           # "ntfy" (Title header + text body) or "json"
+style       = "ntfy"           # "ntfy" (Title header + text body), "gchat"
+                               # (Google Chat {"text"}), or "json".
+                               # Optional here: normally set from the admin UI
+                               # (Settings → Push Alerts); this block fixes it
+                               # at install time and locks the UI control.
 
 [[peers]]                      # other SparkDash installs summarised on the front page
 name = "othernode"
@@ -419,8 +423,9 @@ endpoints are `require_admin`. Endpoints: `GET /api/admin/recipe/current`,
 - Recipe **guard rails**: recipes declaring `cluster_only` / `min_nodes > 1`
   refuse a `--solo` launch, and an unparseable container list never reads as
   a solo job
-- Optional **webhook/ntfy alerting** on state transitions (degraded/recovered,
-  model changed, node offline), debounced
+- Optional **webhook alerting** (ntfy, Google Chat, or generic JSON) on state
+  transitions (degraded/recovered, model changed, node offline), debounced;
+  set/unset from the admin UI (Settings → Push Alerts) or fixed in config.toml
 - Optional **peers strip**: other SparkDash installs' health summarised up top
 - Optional **single sign-on** via a Nexus SSO issuer (the local password
   always keeps working)

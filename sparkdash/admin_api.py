@@ -21,7 +21,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from . import auth, backup, certs, chat, config, hf, recipe_ops, sso, store
+from . import alerts, auth, backup, certs, chat, config, hf, recipe_ops, sso, store
 
 router = APIRouter()
 
@@ -170,6 +170,55 @@ async def sso_disable() -> dict:
         raise HTTPException(status.HTTP_409_CONFLICT,
                             "SSO is fixed by host configuration")
     return {"ok": True, "removed": sso.clear_stored()}
+
+
+# -- push alerts (webhook settings surface; the watcher lives in alerts.py) --
+
+class AlertsBody(BaseModel):
+    webhook_url: str
+    style: str = "json"
+
+
+@router.get("/api/admin/alerts", dependencies=[auth.SessionDep])
+async def alerts_status() -> dict:
+    cfg = alerts.get_config()
+    return {
+        "enabled": alerts.enabled(),
+        "locked": alerts.locked(),
+        "styles": list(alerts.STYLES),
+        "config": cfg,
+    }
+
+
+@router.put("/api/admin/alerts", dependencies=[auth.SessionDep])
+async def alerts_set(body: AlertsBody) -> dict:
+    if alerts.locked():
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "Alerts are fixed by host configuration")
+    url = body.webhook_url.strip()
+    if not url.startswith(("https://", "http://")):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "Webhook must be an http(s):// URL")
+    style = body.style.strip()
+    if style not in alerts.STYLES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "style must be one of: " + ", ".join(alerts.STYLES))
+    alerts.save_stored(url, style)
+    return {"ok": True, "config": alerts.get_config()}
+
+
+@router.delete("/api/admin/alerts", dependencies=[auth.SessionDep])
+async def alerts_disable() -> dict:
+    if alerts.locked():
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "Alerts are fixed by host configuration")
+    return {"ok": True, "removed": alerts.clear_stored()}
+
+
+@router.post("/api/admin/alerts/test", dependencies=[auth.SessionDep])
+async def alerts_test() -> dict:
+    err = await alerts.send_test()
+    return {"ok": err is None, "error": err}
 
 
 # -- API tokens --------------------------------------------------------------

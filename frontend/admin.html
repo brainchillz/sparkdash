@@ -202,6 +202,33 @@
     </div>
 
     <div class="card">
+      <h2>Push Alerts</h2>
+      <p class="meta">POST to a webhook when the cluster state actually changes:
+        degraded/recovered (with reasons), model changed, node offline. Debounced
+        — a transition must survive two checks (~20s) before it sends.</p>
+      <div id="alerts-status" class="meta">loading…</div>
+      <div id="alerts-form" style="display:none; margin-top:10px">
+        <label>Webhook URL</label>
+        <input id="alerts-url" placeholder="https://chat.googleapis.com/v1/spaces/…">
+        <label>Body style</label>
+        <select id="alerts-style">
+          <option value="gchat">Google Chat — {"text": …}</option>
+          <option value="ntfy">ntfy — Title header + text body</option>
+          <option value="json">Generic JSON — {title, message, ts}</option>
+        </select>
+        <div class="err" id="alerts-err"></div>
+        <div class="row" style="margin-top:6px">
+          <button class="btn primary" onclick="alertsSave()">Save</button>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="alerts-test-btn" style="display:none" onclick="alertsTest()">Send test alert</button>
+        <button class="btn danger" id="alerts-remove-btn" style="display:none" onclick="alertsRemove()">Remove</button>
+      </div>
+      <div class="meta" id="alerts-test-result"></div>
+    </div>
+
+    <div class="card">
       <h2>Single Sign-On</h2>
       <p class="meta">Sign in through a Nexus SSO issuer instead of the local password.
         The local password always keeps working — an issuer outage must never lock this
@@ -311,6 +338,58 @@ async function ssoDisable() {
   catch(e){ $("sso-status").textContent = e.message; }
 }
 
+// -- push alerts -----------------------------------------------------------
+async function refreshAlerts() {
+  try {
+    const s = await api("/api/admin/alerts");
+    const c = s.config || {};
+    if (s.enabled) {
+      $("alerts-status").innerHTML =
+        `Enabled — style <b>${c.style}</b>` +
+        ` <span class="meta">(${c.source === "stored" ? "set via UI" : "fixed by host config"})</span>`;
+    } else {
+      $("alerts-status").textContent = s.locked
+        ? "Disabled by host configuration." : "Not configured.";
+    }
+    $("alerts-form").style.display = s.locked ? "none" : "";
+    if (!s.locked && c.webhook_url) {
+      $("alerts-url").value = c.webhook_url;
+      $("alerts-style").value = c.style;
+    }
+    $("alerts-test-btn").style.display = s.enabled ? "" : "none";
+    $("alerts-remove-btn").style.display = (s.enabled && !s.locked) ? "" : "none";
+  } catch(e) { $("alerts-status").textContent = e.message; }
+}
+async function alertsSave() {
+  $("alerts-err").textContent = "";
+  try {
+    await api("/api/admin/alerts", {method:"PUT",
+      headers:{"content-type":"application/json"},
+      body: JSON.stringify({webhook_url:$("alerts-url").value.trim(),
+                            style:$("alerts-style").value})});
+    $("alerts-test-result").textContent = "";
+    refreshAlerts();
+  } catch(e){ $("alerts-err").textContent = e.message; }
+}
+async function alertsTest() {
+  const out = $("alerts-test-result");
+  out.textContent = "sending…";
+  try {
+    const r = await api("/api/admin/alerts/test", {method:"POST"});
+    out.innerHTML = r.ok
+      ? `<span style="color:var(--ok)">✓ delivered</span>`
+      : `<span style="color:var(--bad)">✗ ${r.error || "failed"}</span>`;
+  } catch(e) { out.textContent = e.message; }
+}
+async function alertsRemove() {
+  if (!confirm("Stop sending push alerts from this install?")) return;
+  try {
+    await api("/api/admin/alerts", {method:"DELETE"});
+    $("alerts-url").value = ""; $("alerts-test-result").textContent = "";
+    refreshAlerts();
+  } catch(e){ $("alerts-status").textContent = e.message; }
+}
+
 // -- model canary ---------------------------------------------------------
 async function runCanary() {
   const btn = $("canary-btn"), out = $("canary-result");
@@ -332,6 +411,7 @@ function showContent(user) {
   $("whoami").textContent = "signed in as " + user;
   initNotifications();
   refreshSso();
+  refreshAlerts();
   applyTopology().then(() => {
     // Background pollers run regardless of the active tab (so notifications fire).
     pollOp(); pollJob(); pollBackupJob();
