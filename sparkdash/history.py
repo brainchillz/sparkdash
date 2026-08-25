@@ -31,7 +31,8 @@ NODE_COLS = [
     "disk_used", "disk_total",
 ]
 # Cluster-wide columns (one row per sample, node key "cluster" in rollups).
-CLUSTER_COLS = ["tokens_per_sec", "kv_cache_pct", "requests_running"]
+CLUSTER_COLS = ["tokens_per_sec", "kv_cache_pct", "requests_running",
+                "spec_accept_len"]
 
 RANGES = {
     "1h": 3600, "6h": 6 * 3600, "24h": 86400,
@@ -63,6 +64,13 @@ def init_db() -> None:
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     with _conn() as c:
         c.executescript(_SCHEMA)
+        # Columns added after a deployment's DB was created (CREATE TABLE IF
+        # NOT EXISTS won't grow an existing table).
+        for col in CLUSTER_COLS:
+            try:
+                c.execute(f"ALTER TABLE cluster_samples ADD COLUMN {col} REAL")
+            except sqlite3.OperationalError:
+                pass  # already present
 
 
 @contextmanager
@@ -110,9 +118,11 @@ def record(snap: dict) -> None:
         kv = m.get("vllm:kv_cache_usage_perc")
         if kv is None:
             kv = m.get("vllm:gpu_cache_usage_perc")
+        sd = vllm.get("spec_decode") or {}
         cluster_row = (ts, tok_s,
                        kv * 100 if kv is not None else None,
-                       m.get("vllm:num_requests_running"))
+                       m.get("vllm:num_requests_running"),
+                       sd.get("accept_len"))
 
     with _conn() as c:
         if node_rows:

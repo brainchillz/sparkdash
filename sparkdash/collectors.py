@@ -24,7 +24,7 @@ from typing import Any
 
 import httpx
 
-from . import config
+from . import config, engines
 
 # Remote one-shot probe: sum per-process VRAM (MiB), read root fs used/total
 # bytes, and list sparkrun containers (for orphan detection — a container
@@ -49,6 +49,9 @@ class Hub:
         self._ray: dict[str, Any] = {"reachable": False}
         self._vllm: dict[str, Any] = {"reachable": False}
         self._vllm_fails = 0
+        self._spec_prev: tuple[float, float, float] | None = None
+        self._spec_state: dict[str, Any] = {}
+        self._spec_low_streak = 0
         self._recipe: dict[str, Any] = {"running": False}
         self._client = httpx.AsyncClient(timeout=4.0)
         self._tasks: list[asyncio.Task] = []
@@ -291,11 +294,64 @@ class Hub:
 
         try:
             met = await self._client.get(f"{config.VLLM_BASE}/metrics")
-            state["metrics"] = _parse_vllm_metrics(met.text)
+            state["metrics"], state["engine"] = engines.parse_metrics(met.text)
         except Exception:
-            state["metrics"] = {}
+            state["metrics"], state["engine"] = {}, None
 
+        state["model"] = engines.display_model(state.get("model"),
+                                               state.get("engine"))
+        state["spec_decode"] = self._spec_window(state["metrics"])
         self._vllm = state
+
+    def _spec_window(self, m: dict[str, float]) -> dict | None:
+        """Windowed spec-decode acceptance between consecutive polls.
+
+        The cumulative counters are useless for spotting trouble live — one
+        bad hour poisons them for the engine's lifetime — so acceptance is
+        measured per poll window and only when the window saw real traffic.
+        A collapse (accepted tokens/step below SPEC_COLLAPSE_LEN for
+        SPEC_COLLAPSE_WINDOWS consecutive qualifying windows) means the
+        drafter is dead weight and decode is running at roughly half speed;
+        every case so far traced to client-sent sampling penalties, which the
+        rejection sampler applies to the target but the drafter can't see.
+        """
+        drafts = m.get("vllm:spec_decode_num_drafts_total")
+        accepted = m.get("vllm:spec_decode_num_accepted_tokens_total")
+        if drafts is None or accepted is None:
+            # Engine without speculative decoding — nothing to watch.
+            self._spec_prev = None
+            self._spec_state = {}
+            self._spec_low_streak = 0
+            return None
+        draft_tokens = m.get("vllm:spec_decode_num_draft_tokens_total", 0.0)
+        prev, self._spec_prev = self._spec_prev, (drafts, accepted, draft_tokens)
+        if prev is not None and drafts >= prev[0]:
+            d_steps = drafts - prev[0]
+            d_acc = accepted - prev[1]
+            d_dtok = draft_tokens - prev[2]
+            if d_steps >= config.SPEC_MIN_STEPS:
+                accept_len = 1.0 + d_acc / d_steps
+                if accept_len < config.SPEC_COLLAPSE_LEN:
+                    self._spec_low_streak += 1
+                else:
+                    self._spec_low_streak = 0
+                self._spec_state = {
+                    "accept_len": round(accept_len, 2),
+                    "accept_rate_pct": (round(100.0 * d_acc / d_dtok, 1)
+                                        if d_dtok > 0 else None),
+                    "window_steps": int(d_steps),
+                    "collapsed": (self._spec_low_streak
+                                  >= config.SPEC_COLLAPSE_WINDOWS),
+                    "ts": time.time(),
+                }
+        # Idle traffic keeps the last observed window, but not forever — a
+        # collapse must not stay red for hours after the offending request
+        # finished and the engine went quiet.
+        if self._spec_state and (
+                time.time() - self._spec_state["ts"] > config.SPEC_STALE):
+            self._spec_state = {}
+            self._spec_low_streak = 0
+        return self._spec_state or None
 
     # -- sparkrun status / recipe -----------------------------------------
 
@@ -491,6 +547,12 @@ class Hub:
         if self._canary and not self._canary.get("ok"):
             warnings.append("model canary failed: "
                             + str(self._canary.get("error", "incoherent reply")))
+        sd = self._vllm.get("spec_decode") or {}
+        if sd.get("collapsed"):
+            warnings.append(
+                f"speculative decoding collapsed: {sd['accept_len']} tokens/step "
+                "accepted — decode at roughly half speed; a client is likely "
+                "sending sampling penalties (frequency/presence/repetition)")
 
         return {
             "ts": time.time(),
@@ -521,59 +583,8 @@ def _f(val: Any) -> float | None:
         return None
 
 
-# metric-name -> value, ignoring labels. We only keep the last sample per name,
-# which is correct for this single-engine deployment. `_created` timestamp
-# series are skipped so they can't be mistaken for counters.
-_METRIC_RE = re.compile(
-    r"^((?:vllm|sglang):[a-zA-Z_]+)(?:\{[^}]*\})?\s+([0-9eE.+\-]+)$")
-
-_WANTED = {
-    "vllm:num_requests_running",
-    "vllm:num_requests_waiting",
-    "vllm:kv_cache_usage_perc",
-    "vllm:gpu_cache_usage_perc",
-    "vllm:prefix_cache_queries_total",
-    "vllm:prefix_cache_hits_total",
-    "vllm:prompt_tokens_total",
-    "vllm:generation_tokens_total",
-    "vllm:request_success_total",
-}
-
-# SGLang serves the same concepts under its own prefix (run with
-# --enable-metrics). Normalised to the vllm: names so every consumer —
-# frontend, history sampler, Prometheus exporter — is engine-agnostic.
-_SGLANG_MAP = {
-    "sglang:num_running_reqs": "vllm:num_requests_running",
-    "sglang:num_queue_reqs": "vllm:num_requests_waiting",
-    "sglang:token_usage": "vllm:kv_cache_usage_perc",
-    "sglang:prompt_tokens_total": "vllm:prompt_tokens_total",
-    "sglang:generation_tokens_total": "vllm:generation_tokens_total",
-    "sglang:num_requests_total": "vllm:request_success_total",
-    "sglang:cache_hit_rate": "prefix_cache_hit_rate",   # already a 0-1 ratio
-}
-
-
-def _parse_vllm_metrics(text: str) -> dict[str, float]:
-    out: dict[str, float] = {}
-    for line in text.splitlines():
-        if line.startswith("#") or "_created" in line:
-            continue
-        m = _METRIC_RE.match(line)
-        if not m:
-            continue
-        name, value = m.group(1), m.group(2)
-        name = _SGLANG_MAP.get(name, name)
-        if name in _WANTED or name == "prefix_cache_hit_rate":
-            try:
-                out[name] = out.get(name, 0.0) + float(value)
-            except ValueError:
-                pass
-    # Derived: prefix-cache hit rate (vLLM exposes the two counters instead).
-    q = out.get("vllm:prefix_cache_queries_total", 0.0)
-    h = out.get("vllm:prefix_cache_hits_total", 0.0)
-    if q > 0:
-        out["prefix_cache_hit_rate"] = h / q
-    return out
+# Metric scraping and per-engine normalization live in engines.py — the
+# collector consumes only the normalized names.
 
 
 # Header line. Cluster jobs: "Job: minimax-2.7  (tp=2)  [e6b6dfeb53aa]  (2 container(s))"

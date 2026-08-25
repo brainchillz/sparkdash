@@ -66,6 +66,7 @@ const CHARTS = [
   { key: "disk_pct",       title: "Storage used", unit: "%", max: 100, derived: true },
   { key: "tokens_per_sec", title: "Generation throughput", unit: "tok/s", cluster: true },
   { key: "kv_cache_pct",   title: "KV cache usage", unit: "%", max: 100, cluster: true },
+  { key: "spec_accept_len", title: "Draft acceptance", unit: "tok/step", cluster: true },
 ];
 
 let range = localStorage.getItem("sd-hist-range") || "24h";

@@ -90,6 +90,8 @@ def _state_of(snap: dict) -> dict:
         "model": (snap.get("vllm") or {}).get("model"),
         "offline": tuple(sorted(n["name"] for n in snap.get("nodes", [])
                                 if not n.get("online"))),
+        "spec_collapsed": bool(
+            ((snap.get("vllm") or {}).get("spec_decode") or {}).get("collapsed")),
     }
 
 
@@ -107,6 +109,16 @@ def _describe(prev: dict, cur: dict, snap: dict) -> list[tuple[str, str]]:
     newly_off = set(cur["offline"]) - set(prev["offline"])
     if newly_off:
         out.append((f"{_tag()}: node offline", ", ".join(sorted(newly_off))))
+    if cur["spec_collapsed"] and not prev["spec_collapsed"]:
+        sd = (snap.get("vllm") or {}).get("spec_decode") or {}
+        out.append((
+            f"{_tag()}: spec decode collapsed",
+            f"{sd.get('accept_len', '?')} tokens/step accepted — decode at "
+            "roughly half speed. Likely a client sending sampling penalties "
+            "(frequency/presence/repetition); find the client and clear them."))
+    elif prev["spec_collapsed"] and not cur["spec_collapsed"]:
+        out.append((f"{_tag()}: spec decode recovered",
+                    "draft acceptance back to normal"))
     return out
 
 

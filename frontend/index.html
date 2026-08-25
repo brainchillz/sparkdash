@@ -36,7 +36,7 @@
   </div>
 
   <div class="card" id="vllm-card" style="margin-top:16px;">
-    <h2>Inference &mdash; vLLM Metrics</h2>
+    <h2 id="vllm-title">Inference &mdash; Serving Metrics</h2>
     <div id="vllm-body"><span class="meta">waiting for data…</span></div>
   </div>
 
@@ -127,7 +127,12 @@ function renderRay(ray, vllm, recipe, nodeCount) {
   }
   // No "unreachable" placeholder: sparkrun 0.3.x dropped Ray entirely, so an
   // absent dashboard is the normal state — the card is pure vLLM status then.
-  $("ray-title").textContent = html ? "Ray Cluster" : "vLLM";
+  // The serving engine names itself from its metrics prefix; "vLLM" is only
+  // the default while nothing has been scraped yet.
+  const ENGINE_NAMES = {vllm: "vLLM", sglang: "SGLang", llamacpp: "llama.cpp"};
+  const engineName = ENGINE_NAMES[vllm && vllm.engine] || "vLLM";
+  $("ray-title").textContent = html ? "Ray Cluster" : engineName;
+  $("vllm-title").textContent = `Inference — ${engineName} Metrics`;
   // vLLM health also surfaces here as a quick line (the whole card, when solo).
   const sep = html ? "margin-top:10px;border-top:1px solid var(--border);padding-top:10px" : "";
   let vd = vllm && vllm.healthy ? "ok" : (vllm && vllm.reachable ? "warn" : "bad");
@@ -138,7 +143,7 @@ function renderRay(ray, vllm, recipe, nodeCount) {
   const model = vllm && vllm.model ? vllm.model : "—";
   $("ray-body").innerHTML = html +
     `<div class="kv" style="${sep}">
-       <span class="k"><span class="dot ${vd}" style="display:inline-block;margin-right:6px"></span>vLLM</span>
+       <span class="k"><span class="dot ${vd}" style="display:inline-block;margin-right:6px"></span>${engineName}</span>
        <span class="v">${vt}</span></div>` +
     `<div class="model-name">${model}</div>` +
     (vllm && vllm.max_model_len ? `<div class="meta">context ${(vllm.max_model_len/1000).toFixed(0)}k tokens</div>` : "");
@@ -159,11 +164,18 @@ function renderVllm(vllm, recipe) {
   const gen = m["vllm:generation_tokens_total"];
   const prompt = m["vllm:prompt_tokens_total"];
   const tps = (hist["tokps"] && hist["tokps"].length) ? hist["tokps"][hist["tokps"].length - 1] : null;
-  const metric = (num, lbl) => `<div class="metric"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`;
+  const sd = vllm.spec_decode;
+  const metric = (num, lbl, style) => `<div class="metric"${style ? ` style="${style}"` : ""}><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`;
+  // Windowed draft acceptance: healthy 2-3.5 tokens/step; collapsed (<1.6,
+  // usually client sampling penalties) means decode at roughly half speed.
+  const sdTile = sd == null ? "" :
+    metric(sd.accept_len.toFixed(2), "accepted/step",
+           sd.collapsed ? "color:var(--bad)" : "");
   $("vllm-body").innerHTML = `<div class="metric-row">
     ${metric(running, "requests running")}
     ${metric(waiting, "requests waiting")}
     ${metric(tps == null ? "—" : tps.toFixed(1), "tokens/sec")}
+    ${sdTile}
     ${metric(kv_cache == null ? "—" : (kv_cache*100).toFixed(1)+"%", "KV cache used")}
     ${metric(hit == null ? "—" : (hit*100).toFixed(1)+"%", "prefix cache hit")}
     ${metric(gen == null ? "—" : Intl.NumberFormat().format(Math.round(gen)), "tokens generated")}

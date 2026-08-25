@@ -81,6 +81,12 @@ def render_prometheus(snap: dict) -> str:
             "KV-cache utilisation (0-1).")
     doc.add("sparkdash_vllm_prefix_cache_hit_ratio", m.get("prefix_cache_hit_rate"),
             "Prefix-cache hit rate (0-1).")
+    sd = vllm.get("spec_decode") or {}
+    doc.add("sparkdash_vllm_spec_accept_len", sd.get("accept_len"),
+            "Speculative decoding: accepted tokens per drafter step, windowed "
+            "over recent polls (healthy 2-3.5; <1.6 = collapsed).")
+    doc.add("sparkdash_vllm_spec_collapsed", sd.get("collapsed"),
+            "1 while windowed draft acceptance is collapsed.")
 
     recipe = snap.get("recipe", {})
     doc.add("sparkdash_recipe_running", bool(recipe.get("running")),

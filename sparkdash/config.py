@@ -77,6 +77,15 @@ BROADCAST_INTERVAL = 2.0
 MONITOR_STALE = 15.0   # no real monitor frame for this long -> stream is wedged
 PROBE_STALE = 30.0     # VRAM/disk probe data older than this is dropped
 
+# Speculative-decoding acceptance watch. Windowed over consecutive vLLM polls;
+# a window only counts when it saw SPEC_MIN_STEPS drafter steps. Healthy DSpark
+# on DeepSeek accepts 2-3.5 tokens/step; client sampling penalties (frequency/
+# presence/repetition) push the whole engine below ~1.5 and halve throughput.
+SPEC_MIN_STEPS = 25       # drafter steps a window needs before it counts
+SPEC_COLLAPSE_LEN = 1.6   # accepted tokens/step below this = collapsed
+SPEC_COLLAPSE_WINDOWS = 2 # consecutive low windows before flagging
+SPEC_STALE = 300.0        # no qualifying window for this long -> state expires
+
 # -- Serving / data / auth ------------------------------------------------
 
 PORT = int(os.environ.get("SPARKDASH_PORT", "7862"))
