@@ -170,12 +170,15 @@ PEER_POLL = 15.0
 
 # -- Model canary ---------------------------------------------------------
 #
-# A one-token-budget real chat completion that proves the model produces
-# coherent output ("/health returns 200" is not that — vLLM binds the port
-# before loading, and a garbling model serves 200s). Run from the admin UI;
-# set canary_interval > 0 (seconds) to also run it on a timer.
+# A tiny real chat completion that proves the model produces coherent output
+# ("/health returns 200" is not that — vLLM binds the port before loading, and
+# a garbling model serves 200s). Run from the admin UI; set canary_interval > 0
+# (seconds) to also run it on a timer. Sampled greedily, so one model gives one
+# answer; the token budget leaves room for the thinking preamble some chat
+# templates put into the visible reply (GLM's does, even at low effort — 32
+# tokens cut it off before the answer a few times a day).
 CANARY_INTERVAL = float(_cfg.get("canary_interval", 0) or 0)
-CANARY_MAX_TOKENS = 32
+CANARY_MAX_TOKENS = 128
 
 # -- Model preload --------------------------------------------------------
 

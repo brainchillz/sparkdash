@@ -7,7 +7,10 @@ Guards a sparkrun recipe or an engine stack (config.STACKS) the same way:
   2. /health      answers 200 once the engine is past the startup grace
   3. canary       the periodic real completion (collectors.run_canary) passed
 
-A failure must repeat WATCHDOG_FAIL_THRESHOLD checks in a row. Then it
+A failure must repeat WATCHDOG_FAIL_THRESHOLD checks in a row, each judged
+on fresh evidence: the canary runs on its own (slower) timer, so a check that
+would re-count a failed sample it already counted re-runs the canary first
+instead of reading the same reply twice. Then it
 alerts through the configured webhook, and — if every node is online, no
 operation is in progress, and no automatic restart happened within the
 cooldown — restarts the engine through the same controller the admin UI
@@ -32,7 +35,7 @@ from . import alerts, config, ops, store
 state: dict = {
     "last_check": None, "last_status": "not run yet", "failures": 0,
     "last_reason": None, "last_alert": None, "last_restart": None,
-    "restarts": 0, "guarding": None,
+    "restarts": 0, "guarding": None, "canary_ts": None,
 }
 
 
@@ -88,7 +91,8 @@ def _evaluate(snap: dict) -> str | None:
             and time.time() - canary["ts"] < max(2 * config.CANARY_INTERVAL, 600)
             and canary.get("error") != "no model loaded"
             and not canary.get("ok")):
-        return "model canary failed: " + str(canary.get("error") or "incoherent reply")
+        return ("model canary failed: " + str(canary.get("error") or "incoherent reply")
+                + (f"; reply: {canary['reply'][:80]!r}" if canary.get("reply") else ""))
     return None
 
 
@@ -133,6 +137,15 @@ async def check(hub) -> None:
         state["last_status"] = f"operation in progress ({ops.state.status().get('action')}); skipped"
         return
     reason = _evaluate(snap)
+    if reason is not None and reason.startswith("model canary failed"):
+        # One failed canary sample counts once. If this is the sample the
+        # previous check already counted, get a fresh one before judging.
+        ts = (snap.get("canary") or {}).get("ts")
+        if ts is not None and ts == state.get("canary_ts"):
+            await hub.run_canary()
+            snap = hub.snapshot()
+            reason = _evaluate(snap)
+        state["canary_ts"] = (snap.get("canary") or {}).get("ts")
     if reason is None:
         if state["failures"] >= config.WATCHDOG_FAIL_THRESHOLD:
             await alerts.send("recovered", f"{eng['label']} is serving again.")

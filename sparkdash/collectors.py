@@ -435,12 +435,15 @@ class Hub:
             "messages": [{"role": "user",
                           "content": "Reply with exactly: CANARY OK"}],
             "max_tokens": config.CANARY_MAX_TOKENS,
+            "temperature": 0,     # greedy: the same model gives the same reply
             "stream": True,
-            # Both spellings of "don't think": DeepSeek templates use
-            # `thinking`, Qwen templates use `enable_thinking`. Jinja ignores
-            # whichever one a template doesn't know.
+            # Every spelling of "think as little as possible": DeepSeek
+            # templates use `thinking`, Qwen's `enable_thinking`, GLM's only
+            # `reasoning_effort` (low|high, no off switch). Jinja ignores
+            # whichever ones a template doesn't know.
             "chat_template_kwargs": {"thinking": False,
-                                     "enable_thinking": False},
+                                     "enable_thinking": False,
+                                     "reasoning_effort": "low"},
         }
         text, t0, t_first = "", time.monotonic(), None
         try:

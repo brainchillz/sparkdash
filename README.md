@@ -419,7 +419,9 @@ a time across both kinds, with live streamed output. All endpoints are
 A background check every minute guards whichever engine owns the port — a
 recipe or a stack, the same way: every expected container is `Up`, `/health`
 answers once the engine is past the startup grace (30 min), and the periodic
-model canary passed. After two consecutive failing checks it alerts through
+model canary passed (a failed canary sample counts once; the next check
+re-runs the canary rather than re-reading the same reply). After two
+consecutive failing checks it alerts through
 the push-alert webhook; then, when every node is online, no operation is in
 progress and no automatic restart happened within the cooldown (40 min), it
 restarts the engine through the same controller the UI uses, so the restart
