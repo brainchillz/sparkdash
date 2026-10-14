@@ -16,7 +16,7 @@ from fastapi.responses import (FileResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse)
 from fastapi.staticfiles import StaticFiles
 
-from . import alerts, auth, config, history, logstream, sso, store
+from . import alerts, auth, config, history, logstream, sso, store, watchdog
 from .admin_api import router as admin_router
 from .collectors import Hub
 from .metrics import render_prometheus
@@ -28,15 +28,17 @@ FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 app = FastAPI(title="SparkDash")
 app.include_router(admin_router)
 hub = Hub()
+app.state.hub = hub        # admin routes read the live snapshot through this
 clients: set[WebSocket] = set()
 _broadcaster: asyncio.Task | None = None
 _sampler: asyncio.Task | None = None
 _alerter: asyncio.Task | None = None
+_watchdog: asyncio.Task | None = None
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _broadcaster, _sampler, _alerter
+    global _broadcaster, _sampler, _alerter, _watchdog
     store.init_db()
     store.purge_expired_sessions()
     history.init_db()
@@ -44,11 +46,12 @@ async def _startup() -> None:
     _broadcaster = asyncio.create_task(_broadcast_loop())
     _sampler = asyncio.create_task(history.sampler_loop(hub))
     _alerter = asyncio.create_task(alerts.watch(hub))
+    _watchdog = asyncio.create_task(watchdog.watch(hub))
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    for task in (_broadcaster, _sampler, _alerter):
+    for task in (_broadcaster, _sampler, _alerter, _watchdog):
         if task:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -123,21 +126,33 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
 @app.websocket("/api/logs/ws")
 async def logs_ws(ws: WebSocket) -> None:
-    """Stream the running recipe's head-container logs (docker logs -f)."""
+    """Stream the running engine's head-container logs: the recipe's head
+    container (vLLM serve log) or a stack's rank-0 container (docker logs)."""
     await ws.accept()
-    recipe = hub.snapshot().get("recipe", {})
-    if not recipe.get("running"):
-        await ws.send_text("[sparkdash] No recipe is currently running.")
+    snap = hub.snapshot()
+    recipe = snap.get("recipe", {})
+    engine = snap.get("engine") or {}
+    if engine.get("owner") == "stack":
+        container = engine.get("log_container")
+        if not container:
+            await ws.send_text(f"[sparkdash] The {engine.get('label')} stack has no "
+                               "running container on this node to read logs from.")
+            await ws.close()
+            return
+        label = f"stack {engine.get('label')}"
+    elif recipe.get("running"):
+        container = await logstream.find_container(recipe["id"])
+        if not container:
+            await ws.send_text(f"[sparkdash] Container for recipe "
+                               f"{recipe.get('name')} not found.")
+            await ws.close()
+            return
+        label = f"recipe {recipe.get('name')}"
+    else:
+        await ws.send_text("[sparkdash] No engine is currently running.")
         await ws.close()
         return
-    container = await logstream.find_container(recipe["id"])
-    if not container:
-        await ws.send_text(f"[sparkdash] Container for recipe "
-                           f"{recipe.get('name')} not found.")
-        await ws.close()
-        return
-    await ws.send_text(f"[sparkdash] Attached to {container} — recipe "
-                       f"{recipe.get('name')}\n")
+    await ws.send_text(f"[sparkdash] Attached to {container} — {label}\n")
 
     stream = await logstream.start_stream(container, tail=400)
 

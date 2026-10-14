@@ -23,11 +23,10 @@ import time
 
 import httpx
 
-from . import config
+from . import config, ops
 from .collectors import _parse_status
 
 _HEALTH_TIMEOUT = 20 * 60   # allow big models time to load weights
-_MAX_OUTPUT = 500
 
 # sparkrun labels a workload with the recipe argument, so restart re-runs from a
 # file named after the model to keep the dashboard name clean and stable.
@@ -69,7 +68,8 @@ def saved_recipes() -> list[dict]:
                 continue
             path = f"{_SAVED_DIR}/{fn}"
             out.append({"name": re.sub(r"\.ya?ml$", "", fn), "path": path,
-                        "model": _read_model(path)})
+                        "model": _read_model(path),
+                        "extra_models": _read_extra_models(path)})
     except OSError:
         pass
     return out
@@ -84,6 +84,28 @@ def _read_model(path: str) -> str:
     except OSError:
         pass
     return ""
+
+
+def _read_extra_models(path: str) -> list[str]:
+    """Companion models a recipe distributes besides ``model:`` (e.g. a
+    speculative drafter under distribution.models.entries) — the preload
+    picker offers these too so a pre-download is actually complete."""
+    out, in_dist = [], False
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.startswith("distribution:"):
+                    in_dist = True
+                    continue
+                if in_dist and line[:1] not in (" ", "\t", "\n"):
+                    break  # next top-level key ends the block
+                if in_dist:
+                    m = re.match(r"\s*-\s*name:\s*(\S+)", line)
+                    if m:
+                        out.append(m.group(1).strip("'\""))
+    except OSError:
+        pass
+    return out
 
 
 def _clean_base(model: str, fallback: str | None) -> str:
@@ -167,73 +189,48 @@ async def preflight(recipe: str, mode: str) -> dict:
 
 
 class RecipeController:
-    def __init__(self) -> None:
-        self._task: asyncio.Task | None = None
-        self._op: dict = {"active": False, "action": None, "phase": "idle",
-                          "output": []}
+    """sparkrun recipe lifecycle. Operation state (one at a time, streamed
+    output) lives in ops.state, shared with the stack controller."""
 
     def status(self) -> dict:
-        s = dict(self._op)
-        s["output"] = s.get("output", [])[-250:]  # cap payload
-        return s
+        return ops.state.status()
 
     def _busy(self) -> bool:
-        return self._task is not None and not self._task.done()
+        return ops.state.busy()
 
     # -- public entry points --------------------------------------------------
 
     def start(self, recipe: str, mode: str) -> None:
-        if self._busy():
-            raise RuntimeError("An operation is already running")
-        self._begin("start", recipe, mode)
-        self._task = asyncio.create_task(self._do_start(recipe, mode))
+        ops.state.launch("start", self._do_start(recipe, mode),
+                         engine="sparkrun", recipe=recipe, mode=mode)
 
     def stop(self) -> None:
-        if self._busy():
-            raise RuntimeError("An operation is already running")
-        self._begin("stop", None, None)
-        self._task = asyncio.create_task(self._do_stop())
+        ops.state.launch("stop", self._do_stop(), engine="sparkrun")
 
     def restart(self, mode: str | None = None) -> None:
-        if self._busy():
-            raise RuntimeError("An operation is already running")
-        self._begin("restart", None, mode)
-        self._task = asyncio.create_task(self._do_restart(mode))
+        ops.state.launch("restart", self._do_restart(mode),
+                         engine="sparkrun", mode=mode)
 
-    # -- state helpers --------------------------------------------------------
+    def switch(self, recipe: str, mode: str) -> None:
+        """Stop whatever is running (preserving it as 'last'), then start
+        *recipe* — one background op, so the UI can offer a running-state
+        picker without a manual stop-first dance."""
+        ops.state.launch("switch", self._do_switch(recipe, mode),
+                         engine="sparkrun", recipe=recipe, mode=mode)
 
-    def _begin(self, action, recipe, mode) -> None:
-        self._op = {
-            "active": True, "action": action, "phase": "starting",
-            "recipe": recipe, "mode": mode, "output": [],
-            "message": "", "error": None,
-            "started": time.time(), "updated": time.time(),
-        }
+    # -- state helpers (thin wrappers over the shared op state) ---------------
 
     def _touch(self, **kw) -> None:
-        self._op.update(kw)
-        self._op["updated"] = time.time()
+        ops.state.touch(**kw)
 
     def _emit(self, line: str) -> None:
-        out = self._op.setdefault("output", [])
-        out.append(line)
-        del out[:-_MAX_OUTPUT]
-        self._op["updated"] = time.time()
+        ops.state.emit(line)
 
     def _finish(self, ok: bool, message: str, error: str | None = None) -> None:
-        self._touch(active=False, phase=("done" if ok else "error"),
-                    message=message, error=error)
+        ops.state.finish(ok, message, error)
 
     async def _stream(self, argv: list[str]) -> int:
-        """Run a command, streaming its output into the op; return exit code."""
-        self._emit(f"$ {' '.join(argv)}")
-        proc = await asyncio.create_subprocess_exec(
-            *argv, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT)
-        assert proc.stdout is not None
-        async for raw in proc.stdout:
-            self._emit(raw.decode(errors="replace").rstrip("\n"))
-        return await proc.wait()
+        return await ops.state.stream(argv)
 
     async def _wait_healthy(self) -> bool:
         self._touch(phase="loading", message="Waiting for vLLM to become healthy…")
@@ -269,6 +266,26 @@ class RecipeController:
                              "health timeout")
         except Exception as exc:
             self._finish(False, "Start failed", f"{type(exc).__name__}: {exc}")
+
+    async def _do_switch(self, recipe: str, mode: str) -> None:
+        try:
+            rec = await current_recipe()
+            if rec.get("running"):
+                await self._preserve(rec)
+                self._touch(phase="stopping",
+                            message=f"Stopping {rec.get('name')} first")
+                rc = await self._stream(
+                    ["sparkrun", "stop", rec["id"],
+                     "--cluster", config.SPARKRUN_CLUSTER])
+                if rc != 0:
+                    self._finish(False, "Switch failed while stopping",
+                                 f"sparkrun stop exited {rc}")
+                    return
+        except Exception as exc:
+            self._finish(False, "Switch failed while stopping",
+                         f"{type(exc).__name__}: {exc}")
+            return
+        await self._do_start(recipe, mode)
 
     async def _do_stop(self) -> None:
         try:

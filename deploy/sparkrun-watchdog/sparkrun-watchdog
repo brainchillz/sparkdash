@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""sparkrun-watchdog: notice a dead multi-node vLLM job and relaunch it.
+
+Runs from a systemd timer every couple of minutes. Three checks, in order:
+
+  1. container count  — every host the job was placed on must still have its
+                        container "Up" (a rebooted node loses its container
+                        while the other ranks and the API process stay up).
+  2. /health          — must answer 200 once the job is past the startup grace.
+  3. real completion  — a tiny chat completion must come back; the API process
+                        answers /health even when the engine is wedged.
+
+A failure has to repeat FAIL_THRESHOLD runs in a row before anything is done.
+Then, if every host answers SSH and no restart happened within
+RESTART_COOLDOWN, the job is stopped and relaunched from the same recipe with
+the same -o overrides it was started with. If a host is unreachable the
+watchdog alerts and waits — relaunching on three of four nodes helps nobody.
+
+A job the operator stopped on purpose is left alone: the watchdog only acts
+on a job that sparkrun still lists.
+
+Alerts go to the webhook SparkDash is configured with (config.toml [alerts]
+or the admin-UI setting), or WEBHOOK_URL from the watchdog's own config.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.request
+from pathlib import Path
+
+CONF_PATH = Path(os.environ.get("SPARKRUN_WATCHDOG_CONF", "/etc/sparkrun-watchdog.conf"))
+STATE_DIR = Path(os.environ.get("STATE_DIRECTORY", "/var/lib/sparkrun-watchdog"))
+STATE_PATH = STATE_DIR / "state.json"
+
+DEFAULTS = {
+    "CLUSTER": "default",
+    "ENDPOINT": "http://127.0.0.1:8000",
+    "SSH_USER": "nvidia",
+    "SSH_KEY": "",                    # "" -> ssh default keys
+    "STARTUP_GRACE_MIN": "30",        # minutes a fresh job may take to answer /health
+    "PROBE_TIMEOUT": "120",           # seconds for the completion probe
+    "FAIL_THRESHOLD": "2",            # consecutive failing runs before acting
+    "RESTART_COOLDOWN_MIN": "40",     # minutes between automatic restarts
+    "AUTO_RESTART": "1",              # 0 -> alert only
+    "CLEAR_CACHE": "1",               # run `sparkrun setup clear-cache` before relaunch
+    "WEBHOOK_URL": "",
+    "WEBHOOK_STYLE": "",              # json | ntfy | gchat ("" -> SparkDash's style)
+    "SPARKDASH_CONFIG": "/etc/sparkdash/config.toml",
+    "SPARKDASH_ADMIN_DB": "/var/lib/sparkdash/admin.db",
+}
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def load_conf() -> dict:
+    conf = dict(DEFAULTS)
+    if CONF_PATH.is_file():
+        for line in CONF_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            conf[k.strip()] = v.strip().strip("'\"")
+    return conf
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except Exception:
+        return {"failures": 0, "last_restart": 0.0, "last_alert": "", "last_status": ""}
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    tmp.replace(STATE_PATH)
+
+
+# -- alerts ---------------------------------------------------------------
+
+def webhook_config(conf: dict) -> tuple[str, str] | None:
+    if conf["WEBHOOK_URL"]:
+        return conf["WEBHOOK_URL"], conf["WEBHOOK_STYLE"] or "json"
+    try:
+        with open(conf["SPARKDASH_CONFIG"], "rb") as fh:
+            alerts = tomllib.load(fh).get("alerts", {})
+        if alerts.get("webhook_url"):
+            return alerts["webhook_url"], conf["WEBHOOK_STYLE"] or alerts.get("style", "json")
+    except Exception:
+        pass
+    try:
+        db = sqlite3.connect(f"file:{conf['SPARKDASH_ADMIN_DB']}?mode=ro", uri=True)
+        rows = dict(db.execute("select key, value from settings where key like 'alerts.%'"))
+        if rows.get("alerts.webhook_url"):
+            return rows["alerts.webhook_url"], conf["WEBHOOK_STYLE"] or rows.get("alerts.style", "json")
+    except Exception:
+        pass
+    return None
+
+
+def alert(conf: dict, title: str, message: str) -> None:
+    tag = f"sparkrun-watchdog {os.uname().nodename.split('.')[0]}"
+    title = f"{tag}: {title}"
+    log(f"ALERT {title} — {message}")
+    wh = webhook_config(conf)
+    if not wh:
+        return
+    url, style = wh
+    if style == "ntfy":
+        req = urllib.request.Request(url, data=message.encode(), headers={"Title": title})
+    elif style == "gchat":
+        req = urllib.request.Request(url, data=json.dumps({"text": f"*{title}*\n{message}"}).encode(),
+                                     headers={"Content-Type": "application/json"})
+    else:
+        req = urllib.request.Request(url, data=json.dumps({"title": title, "message": message,
+                                                           "ts": time.time()}).encode(),
+                                     headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as exc:
+        log(f"webhook delivery failed: {type(exc).__name__}: {exc}")
+
+
+# -- checks ---------------------------------------------------------------
+
+def run(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+_UP_RE = re.compile(r"^Up\s+(?:(\d+)\s+(second|minute|hour|day|week)s?|About a (minute|hour))", re.I)
+
+
+def up_minutes(status: str) -> float | None:
+    """Minutes a container has been up, from docker's 'Up 9 minutes' text."""
+    m = _UP_RE.match(status.strip())
+    if not m:
+        return None
+    if m.group(3):
+        return 1.0 if m.group(3).lower() == "minute" else 60.0
+    n, unit = float(m.group(1)), m.group(2).lower()
+    return n * {"second": 1 / 60, "minute": 1, "hour": 60, "day": 1440, "week": 10080}[unit]
+
+
+def job_status(conf: dict) -> dict | None:
+    """The single sparkrun job on the cluster, or None if nothing is listed."""
+    p = run(["sparkrun", "status", "--json", "--cluster", conf["CLUSTER"]], timeout=60)
+    if p.returncode != 0:
+        raise RuntimeError(f"sparkrun status failed: {p.stderr.strip()[:200]}")
+    data = json.loads(p.stdout)
+    groups = data.get("groups") or {}
+    if not groups:
+        return None
+    gid, g = next(iter(groups.items()))
+    meta = g.get("meta", {})
+    containers = g.get("containers", [])
+    up = [c for c in containers if str(c.get("status", "")).startswith("Up")]
+    hosts = list(meta.get("hosts") or [])
+    ages = [a for a in (up_minutes(c.get("status", "")) for c in up) if a is not None]
+    return {
+        "id": gid.removeprefix("sparkrun_"),
+        "recipe": meta.get("recipe"),
+        "overrides": meta.get("overrides") or {},
+        "port": meta.get("port") or 8000,
+        "hosts": hosts,
+        "expected": len(hosts) or len(containers),
+        "up": len(up),
+        "missing_hosts": [h for h in hosts if h not in {c.get("host") for c in up}],
+        "youngest_min": min(ages) if ages else None,
+        "pending": bool(data.get("pending_ops")),
+    }
+
+
+def health_ok(endpoint: str) -> bool:
+    try:
+        with urllib.request.urlopen(f"{endpoint}/health", timeout=5) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def served_model(endpoint: str) -> str | None:
+    try:
+        with urllib.request.urlopen(f"{endpoint}/v1/models", timeout=5) as r:
+            return json.load(r)["data"][0]["id"]
+    except Exception:
+        return None
+
+
+def completion_ok(endpoint: str, model: str, timeout: float) -> str | None:
+    """None if a tiny completion came back, else a short reason."""
+    body = {"model": model, "messages": [{"role": "user", "content": "Reply with the single word: ready"}],
+            "max_tokens": 16, "temperature": 0}
+    req = urllib.request.Request(f"{endpoint}/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.load(r)
+    except Exception as exc:
+        return f"completion probe failed: {type(exc).__name__}: {str(exc)[:80]}"
+    choice = (data.get("choices") or [{}])[0]
+    text = ((choice.get("message") or {}).get("content") or "").strip()
+    if not text:
+        return f"completion probe returned no content (finish_reason={choice.get('finish_reason')})"
+    return None
+
+
+def hosts_reachable(conf: dict, hosts: list[str]) -> list[str]:
+    """Hosts that do NOT answer SSH."""
+    down = []
+    for h in hosts:
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new"]
+        if conf["SSH_KEY"]:
+            cmd += ["-i", conf["SSH_KEY"]]
+        cmd += [f"{conf['SSH_USER']}@{h}", "true"]
+        try:
+            if run(cmd, timeout=15).returncode != 0:
+                down.append(h)
+        except subprocess.TimeoutExpired:
+            down.append(h)
+    return down
+
+
+# -- action ---------------------------------------------------------------
+
+def relaunch(conf: dict, job: dict, dry: bool) -> None:
+    cmds = [["sparkrun", "stop", job["id"]]]
+    if conf["CLEAR_CACHE"] == "1":
+        cmds.append(["sparkrun", "setup", "clear-cache", "--cluster", conf["CLUSTER"]])
+    runcmd = ["sparkrun", "run", job["recipe"], "--cluster", conf["CLUSTER"], "--no-follow"]
+    for k, v in job["overrides"].items():
+        runcmd += ["-o", f"{k}={v}"]
+    cmds.append(runcmd)
+    for c in cmds:
+        log(("DRY-RUN " if dry else "") + "exec: " + " ".join(c))
+        if dry:
+            continue
+        p = run(c, timeout=900)
+        tail = (p.stdout + p.stderr).strip().splitlines()[-3:]
+        log(f"  rc={p.returncode} " + " | ".join(tail))
+        if p.returncode != 0 and c[1] != "stop":
+            raise RuntimeError(f"{' '.join(c[:3])} failed rc={p.returncode}")
+
+
+def main(argv: list[str]) -> int:
+    dry = "--dry-run" in argv
+    conf = load_conf()
+    state = load_state()
+    endpoint = conf["ENDPOINT"].rstrip("/")
+    grace = float(conf["STARTUP_GRACE_MIN"])
+
+    try:
+        job = job_status(conf)
+    except Exception as exc:
+        log(f"cannot read sparkrun status: {exc}")
+        return 1
+
+    if job is None:
+        log("no sparkrun job listed; nothing to guard")
+        if state.get("failures"):
+            state.update(failures=0)
+            save_state(state)
+        return 0
+
+    reason: str | None = None
+    starting = job["youngest_min"] is not None and job["youngest_min"] < grace
+    if job["up"] < job["expected"]:
+        reason = (f"{job['up']}/{job['expected']} containers up; missing on "
+                  + ", ".join(job["missing_hosts"] or ["?"]))
+    elif not health_ok(endpoint):
+        if starting or job["pending"]:
+            log(f"job starting ({job['youngest_min']:.0f} min, pending={job['pending']}); health not up yet — ok")
+        else:
+            reason = f"/health not answering 200 after {job['youngest_min']:.0f} min up"
+    else:
+        model = served_model(endpoint) or "default"
+        reason = completion_ok(endpoint, model, float(conf["PROBE_TIMEOUT"]))
+
+    if reason is None:
+        if state.get("failures", 0) >= int(conf["FAIL_THRESHOLD"]):
+            alert(conf, "recovered", f"{job['recipe']} serving again ({job['up']}/{job['expected']} containers).")
+        if state.get("failures"):
+            log(f"ok again after {state['failures']} failing run(s)")
+        state.update(failures=0, last_status="ok")
+        save_state(state)
+        log(f"ok: {job['recipe']} {job['up']}/{job['expected']} containers, completion probe passed")
+        return 0
+
+    state["failures"] = int(state.get("failures", 0)) + 1
+    log(f"FAIL ({state['failures']}/{conf['FAIL_THRESHOLD']}): {reason}")
+    if state["failures"] < int(conf["FAIL_THRESHOLD"]):
+        save_state(state)
+        return 0
+
+    # Confirmed dead. Alert once per distinct reason, then decide whether to act.
+    if state.get("last_alert") != reason:
+        alert(conf, "job dead", f"{job['recipe']}: {reason}")
+        state["last_alert"] = reason
+
+    down = hosts_reachable(conf, job["hosts"])
+    if down:
+        msg = f"waiting: host(s) not answering SSH: {', '.join(down)}"
+        log(msg)
+        if state.get("last_status") != msg:
+            alert(conf, "waiting for host", msg)
+            state["last_status"] = msg
+        save_state(state)
+        return 0
+
+    since = time.time() - float(state.get("last_restart", 0))
+    cooldown = float(conf["RESTART_COOLDOWN_MIN"]) * 60
+    if conf["AUTO_RESTART"] != "1":
+        log("AUTO_RESTART=0; alert only")
+        save_state(state)
+        return 0
+    if since < cooldown:
+        log(f"restart cooldown: last restart {since/60:.0f} min ago (< {cooldown/60:.0f})")
+        save_state(state)
+        return 0
+
+    alert(conf, "restarting job", f"{job['recipe']} on cluster {conf['CLUSTER']}: {reason}. "
+          f"Relaunching with overrides {json.dumps(job['overrides'])}.")
+    try:
+        relaunch(conf, job, dry)
+        if not dry:
+            state.update(last_restart=time.time(), failures=0, last_alert="", last_status="restarted")
+    except Exception as exc:
+        alert(conf, "restart failed", f"{exc}")
+        state["last_status"] = f"restart failed: {exc}"
+    save_state(state)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

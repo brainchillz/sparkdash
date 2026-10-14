@@ -24,7 +24,7 @@
   <div class="grid top">
     <div class="card" id="recipe-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px">
-        <h2 style="margin:0">Recipe / Model</h2>
+        <h2 style="margin:0">Engine / Model</h2>
         <button class="btn" id="logs-btn" onclick="openLogs()" disabled>View logs</button>
       </div>
       <div id="recipe-body"><span class="meta">waiting for data…</span></div>
@@ -97,9 +97,26 @@ function notify(title, body) {
   }
 }
 
-function renderRecipe(r) {
+// Whoever owns the serving port: a sparkrun recipe (job id, tp/pp, per-role
+// containers), an engine stack (config [[stacks]]: one container per node,
+// started outside sparkrun), an unmanaged process, or nothing.
+function renderEngine(e, r) {
+  if (e && e.owner === "stack") {
+    const conts = (e.containers || []).map(c =>
+      `<span class="chip">${c.node} · ${c.up ? "<b>up</b>" : `<span style="color:var(--bad)">${c.status}</span>`}</span>`).join("");
+    $("recipe-body").innerHTML =
+      `<div class="big">${e.label} <span class="meta">engine stack</span></div>
+       <div class="meta" style="margin:2px 0 12px">${e.up}/${e.expected} containers up${e.model ? " · " + e.model : ""}</div>
+       <div class="chips">${conts}</div>`;
+    return;
+  }
+  if (e && e.owner === "foreign") {
+    $("recipe-body").innerHTML = `<div class="big" style="color:var(--bad)">Unmanaged process</div>
+      <div class="meta">The serving port answers, but neither a sparkrun recipe nor a configured engine stack is running.</div>`;
+    return;
+  }
   if (!r || !r.running) {
-    $("recipe-body").innerHTML = `<span class="meta">No recipe running.</span>`;
+    $("recipe-body").innerHTML = `<span class="meta">No engine running.</span>`;
     return;
   }
   const conts = (r.containers || []).map(c =>
@@ -115,6 +132,7 @@ function renderRay(ray, vllm, recipe, nodeCount) {
   // Solo jobs / single-node installs run without Ray — drop the Ray section
   // entirely and let this card be pure vLLM status.
   const solo = (recipe && recipe.running && recipe.solo) || nodeCount <= 1;
+  const engineUp = (recipe && recipe.running) || (window._engine && window._engine.owner === "stack");
   let html = "";
   if (ray && ray.reachable) {
     const nodes = (ray.nodes || []).map(n => {
@@ -139,7 +157,7 @@ function renderRay(ray, vllm, recipe, nodeCount) {
   let vt = vllm && vllm.healthy ? "healthy" : (vllm && vllm.reachable ? "reachable" : "down");
   // Recipe container up but the API not answering = almost always still
   // loading weights — amber "starting", not a red "down".
-  if (recipe && recipe.running && (!vllm || !vllm.reachable)) { vd = "warn"; vt = "starting…"; }
+  if (engineUp && (!vllm || !vllm.reachable)) { vd = "warn"; vt = "starting…"; }
   const model = vllm && vllm.model ? vllm.model : "—";
   $("ray-body").innerHTML = html +
     `<div class="kv" style="${sep}">
@@ -152,7 +170,8 @@ function renderRay(ray, vllm, recipe, nodeCount) {
 function renderVllm(vllm, recipe) {
   const m = (vllm && vllm.metrics) || {};
   if (!vllm || !vllm.reachable) {
-    $("vllm-body").innerHTML = recipe && recipe.running
+    const engineUp = (recipe && recipe.running) || (window._engine && window._engine.owner === "stack");
+    $("vllm-body").innerHTML = engineUp
       ? `<span class="meta">vLLM not answering yet — model starting or restarting.</span>`
       : `<span class="meta">vLLM endpoint unreachable.</span>`;
     return;
@@ -255,7 +274,8 @@ function render(snap) {
   $("conn-dot").className = "dot " + (ok ? "ok" : "warn");
   $("conn-text").textContent = ok ? "Cluster healthy" : "Degraded";
   $("clock").textContent = new Date(snap.ts * 1000).toLocaleTimeString();
-  $("logs-btn").disabled = !(snap.recipe && snap.recipe.running);
+  window._engine = snap.engine || null;
+  $("logs-btn").disabled = !(snap.engine && (snap.engine.owner === "sparkrun" || snap.engine.owner === "stack"));
 
   // generation throughput (tokens/sec) from the cumulative counter
   const gen = snap.vllm && snap.vllm.metrics && snap.vllm.metrics["vllm:generation_tokens_total"];
@@ -276,7 +296,7 @@ function render(snap) {
     _prevOnline[n.name] = n.online;
   });
 
-  renderRecipe(snap.recipe);
+  renderEngine(snap.engine, snap.recipe);
   renderRay(snap.ray, snap.vllm, snap.recipe, snap.node_count);
   renderVllm(snap.vllm, snap.recipe);
   renderNodes(snap.nodes);

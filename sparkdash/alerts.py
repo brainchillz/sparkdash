@@ -92,7 +92,15 @@ def _state_of(snap: dict) -> dict:
                                 if not n.get("online"))),
         "spec_collapsed": bool(
             ((snap.get("vllm") or {}).get("spec_decode") or {}).get("collapsed")),
+        "engine": _engine_key(snap.get("engine") or {}),
     }
+
+
+def _engine_key(eng: dict) -> str | None:
+    owner = eng.get("owner")
+    if owner in ("sparkrun", "stack"):
+        return f"{owner}:{eng.get('label') or eng.get('name')}"
+    return owner if owner == "foreign" else None
 
 
 def _describe(prev: dict, cur: dict, snap: dict) -> list[tuple[str, str]]:
@@ -106,6 +114,22 @@ def _describe(prev: dict, cur: dict, snap: dict) -> list[tuple[str, str]]:
     if cur["model"] != prev["model"]:
         out.append((f"{_tag()}: model changed",
                     f"{prev['model'] or '—'} → {cur['model'] or '—'}"))
+    # "nothing → engine" is already announced by "cluster healthy" / "model
+    # changed" (and fires on every SparkDash restart, before the probes have
+    # seen the containers); only a swap or a disappearance is news.
+    if cur["engine"] != prev["engine"] and prev["engine"]:
+        eng = snap.get("engine") or {}
+        def _name(k):
+            if not k:
+                return "nothing"
+            if k == "foreign":
+                return "an unmanaged process"
+            kind, _, label = k.partition(":")
+            return f"{label} ({'recipe' if kind == 'sparkrun' else 'stack'})"
+        out.append((f"{_tag()}: engine changed",
+                    f"{_name(prev['engine'])} → {_name(cur['engine'])}"
+                    + (f" — {eng.get('up')}/{eng.get('expected')} containers up"
+                       if eng.get("owner") in ("sparkrun", "stack") else "")))
     newly_off = set(cur["offline"]) - set(prev["offline"])
     if newly_off:
         out.append((f"{_tag()}: node offline", ", ".join(sorted(newly_off))))
@@ -185,3 +209,19 @@ async def watch(hub) -> None:
             confirmed, pending = cur, None
     finally:
         await client.aclose()
+
+
+async def send(title: str, message: str) -> bool:
+    """Deliver one message through the active webhook (no-op when alerts are
+    off). For callers outside the transition watcher, e.g. the watchdog."""
+    cfg = get_config()
+    if not cfg:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await _send(client, cfg, f"{_tag()}: {title}", message)
+            r.raise_for_status()
+            return True
+    except Exception as exc:
+        print(f"[sparkdash] alert_send: {type(exc).__name__}: {exc}", flush=True)
+        return False

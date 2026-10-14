@@ -39,7 +39,7 @@
   <div id="admin-content" style="display:none">
 
     <div class="tabs">
-      <button class="tab" data-tab="recipes" onclick="showTab('recipes')">Recipes</button>
+      <button class="tab" data-tab="recipes" onclick="showTab('recipes')">Engine</button>
       <button class="tab" data-tab="models" onclick="showTab('models')">Models</button>
       <button class="tab" data-tab="chat" onclick="showTab('chat')">Chat</button>
       <button class="tab" data-tab="settings" onclick="showTab('settings')">Settings</button>
@@ -47,10 +47,26 @@
 
     <div class="tabpanel" id="tab-recipes">
     <div class="card">
-      <h2>Recipe Control</h2>
+      <h2>Engine Control</h2>
       <div id="ctl-current" class="meta">loading…</div>
 
-      <div id="ctl-start-form" style="margin-top:14px; display:none">
+      <div id="ctl-engine-pick" style="margin-top:14px; display:none">
+        <label>Engine to start</label>
+        <select id="ctl-engine" onchange="onCtlEngine()">
+          <option value="sparkrun">sparkrun recipe</option>
+        </select>
+      </div>
+
+      <div id="ctl-stack-form" style="margin-top:10px; display:none">
+        <div class="meta" id="stack-desc"></div>
+        <div class="meta" id="stack-preflight" style="margin-top:8px"></div>
+        <div class="err" id="stack-err"></div>
+        <div class="row" style="margin-top:6px; justify-content:flex-end">
+          <button class="btn primary" id="stack-start" onclick="stackStart()">Start</button>
+        </div>
+      </div>
+
+      <div id="ctl-start-form" style="margin-top:10px; display:none">
         <label>Recipe to start</label>
         <select id="ctl-recipe" onchange="onCtlRecipe()">
           <option value="">— choose a recipe —</option>
@@ -229,6 +245,61 @@
     </div>
 
     <div class="card">
+      <h2>Auto-recovery Watchdog</h2>
+      <p class="meta">Guards whichever engine owns the serving port — a sparkrun recipe or an
+        engine stack: every container up, /health answering once past the startup grace, the
+        model canary passing. Two consecutive failing checks alert through the webhook above;
+        then, when every node is online and no automatic restart happened within the cooldown,
+        it restarts the engine (the restart shows in Engine Control). Nothing running = nothing
+        guarded, so a deliberate stop is never undone.</p>
+      <div id="wd-status" class="meta">loading…</div>
+      <div class="row" style="margin-top:10px; gap:18px">
+        <label style="display:inline-flex; align-items:center; gap:6px; margin:0; cursor:pointer">
+          <input type="checkbox" id="wd-enabled" onchange="wdToggle()"> Enabled
+        </label>
+        <button class="btn" onclick="wdCheck()">Check now</button>
+      </div>
+      <div class="err" id="wd-err"></div>
+    </div>
+
+    <div class="card">
+      <h2>Hugging Face Token</h2>
+      <p class="meta">Access token for gated models (Llama, …). Stored in
+        <code>~/.cache/huggingface/token</code> on the head — the standard hf-CLI
+        location, so preloads and recipe downloads pick it up automatically.
+        Validated against huggingface.co before saving; only ever shown masked.</p>
+      <div id="hftoken-status" class="meta">loading…</div>
+      <div style="margin-top:10px">
+        <label>Token (hf_…)</label>
+        <input id="hftoken-input" type="password" placeholder="hf_xxxxxxxxxxxxxxxxxxxx" autocomplete="off">
+        <div class="err" id="hftoken-err"></div>
+        <div class="row" style="margin-top:6px">
+          <button class="btn primary" onclick="hftokenSave()">Validate &amp; save</button>
+          <button class="btn danger" id="hftoken-remove-btn" style="display:none" onclick="hftokenRemove()">Remove</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Download Rate Cap</h2>
+      <p class="meta">Cap internet-sourced traffic on the head while a model preload
+        downloads, so a 182&nbsp;GB pull doesn't flatten the connection for everyone
+        else in the house. LAN, RDMA mirroring and NFS are exempt. Applies at the
+        next preload — or immediately if one is downloading right now. Cancelled
+        downloads resume where they left off.</p>
+      <div id="netcap-status" class="meta">loading…</div>
+      <div id="netcap-form" style="display:none; margin-top:10px">
+        <label>Cap (Mbit/s, e.g. 700)</label>
+        <input id="netcap-mbit" type="number" min="50" max="100000" placeholder="700" style="max-width:140px">
+        <div class="err" id="netcap-err"></div>
+        <div class="row" style="margin-top:6px">
+          <button class="btn primary" onclick="netcapSave()">Save</button>
+          <button class="btn danger" id="netcap-remove-btn" style="display:none" onclick="netcapRemove()">Remove</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
       <h2>Single Sign-On</h2>
       <p class="meta">Sign in through a Nexus SSO issuer instead of the local password.
         The local password always keeps working — an issuer outage must never lock this
@@ -390,6 +461,79 @@ async function alertsRemove() {
   } catch(e){ $("alerts-status").textContent = e.message; }
 }
 
+// -- hugging face token -----------------------------------------------------
+async function refreshHfToken(saved) {
+  try {
+    const s = await api("/api/admin/hftoken");
+    if (s.present) {
+      $("hftoken-status").innerHTML = `Set — <b>${s.masked || "hf_…"}</b>` +
+        (saved ? ` <span style="color:var(--ok)">✓ valid (${saved})</span>` : "") +
+        (s.env ? ` <span class="meta">(an HF_TOKEN env var also exists and wins)</span>` : "");
+    } else {
+      $("hftoken-status").textContent = s.env
+        ? "No token file; using the HF_TOKEN env var."
+        : "Not set — gated models will fail to download.";
+    }
+    $("hftoken-remove-btn").style.display = s.present ? "" : "none";
+  } catch(e) { $("hftoken-status").textContent = e.message; }
+}
+async function hftokenSave() {
+  $("hftoken-err").textContent = "";
+  const btn = event.target; btn.disabled = true;
+  try {
+    const r = await api("/api/admin/hftoken", {method:"PUT",
+      headers:{"content-type":"application/json"},
+      body: JSON.stringify({token: $("hftoken-input").value.trim()})});
+    $("hftoken-input").value = "";
+    refreshHfToken(r.account);
+  } catch(e){ $("hftoken-err").textContent = e.message; }
+  finally { btn.disabled = false; }
+}
+async function hftokenRemove() {
+  if (!confirm("Remove the stored Hugging Face token?")) return;
+  try { await api("/api/admin/hftoken", {method:"DELETE"}); refreshHfToken(); }
+  catch(e){ $("hftoken-status").textContent = e.message; }
+}
+
+// -- download rate cap ------------------------------------------------------
+async function refreshNetcap() {
+  try {
+    const s = await api("/api/admin/netcap");
+    const liveNote = s.live && s.live.active
+      ? ` — <b>active now</b> on ${s.live.iface} at ${s.live.mbit} Mbit/s`
+      : "";
+    if (s.mbit > 0) {
+      $("netcap-status").innerHTML =
+        `Enabled — <b>${s.mbit} Mbit/s</b>` +
+        ` <span class="meta">(${s.locked ? "fixed by host config" : "set via UI"})</span>` +
+        liveNote;
+    } else {
+      $("netcap-status").textContent = "Not configured — downloads run at line rate.";
+    }
+    $("netcap-form").style.display = s.locked ? "none" : "";
+    if (!s.locked && s.mbit > 0) $("netcap-mbit").value = s.mbit;
+    $("netcap-remove-btn").style.display = (s.mbit > 0 && !s.locked) ? "" : "none";
+  } catch(e) { $("netcap-status").textContent = e.message; }
+}
+async function netcapSave() {
+  $("netcap-err").textContent = "";
+  try {
+    const r = await api("/api/admin/netcap", {method:"PUT",
+      headers:{"content-type":"application/json"},
+      body: JSON.stringify({mbit: parseInt($("netcap-mbit").value, 10) || 0})});
+    if (r.error) $("netcap-err").textContent = r.error;
+    refreshNetcap();
+  } catch(e){ $("netcap-err").textContent = e.message; }
+}
+async function netcapRemove() {
+  if (!confirm("Remove the download rate cap? Future preloads run at line rate.")) return;
+  try {
+    await api("/api/admin/netcap", {method:"DELETE"});
+    $("netcap-mbit").value = "";
+    refreshNetcap();
+  } catch(e){ $("netcap-status").textContent = e.message; }
+}
+
 // -- model canary ---------------------------------------------------------
 async function runCanary() {
   const btn = $("canary-btn"), out = $("canary-result");
@@ -412,6 +556,9 @@ function showContent(user) {
   initNotifications();
   refreshSso();
   refreshAlerts();
+  refreshWatchdog();
+  refreshNetcap();
+  refreshHfToken();
   applyTopology().then(() => {
     // Background pollers run regardless of the active tab (so notifications fire).
     pollOp(); pollJob(); pollBackupJob();
@@ -424,7 +571,7 @@ const TAB_LOADERS = {
   recipes: loadRecipeControl,
   models: () => { loadRecipes(); loadCache(); loadBackupTarget(); loadBackups(); },
   chat: initChat,
-  settings: () => { loadTokens(); loadCert(); },
+  settings: () => { loadTokens(); loadCert(); refreshWatchdog(); },
 };
 function showTab(name){
   document.querySelectorAll(".tabpanel").forEach(p => p.classList.remove("active"));
@@ -452,7 +599,34 @@ async function applyTopology(){
 // -- recipe control ------------------------------------------------------
 let opTimer = null, ctlRecipes = [], lastOpActive = false;
 
+let ctlStacks = [];
+
+function enginePick(){ return $("ctl-engine").value; }   // "sparkrun" | "stack:<name>"
+
+function buildEnginePicker(stacks){
+  const sel = $("ctl-engine");
+  const keep = sel.value || localStorage.getItem("sparkdash.engine") || "sparkrun";
+  sel.length = 1;
+  stacks.forEach(s => {
+    const o = document.createElement("option");
+    o.value = "stack:" + s.name;
+    o.textContent = `${s.label}  ·  engine stack` + (s.model ? `  (${s.model})` : "");
+    sel.appendChild(o);
+  });
+  sel.value = [...sel.options].some(o => o.value === keep) ? keep : "sparkrun";
+  $("ctl-engine-pick").style.display = stacks.length ? "" : "none";
+}
+
 async function loadRecipeControl(){
+  let info;
+  try { info = await api("/api/admin/engine"); }
+  catch(e){ $("ctl-current").innerHTML = `<span class="err">${e.message}</span>`; return; }
+  const eng = info.engine || {owner:"none"};
+  ctlStacks = info.stacks || [];
+  window._engine = eng;
+  buildEnginePicker(ctlStacks);
+  if (eng.owner === "stack") $("ctl-engine").value = "stack:" + eng.name;
+  else if (eng.owner === "sparkrun") $("ctl-engine").value = "sparkrun";
   if (!ctlRecipes.length) {
     try { ctlRecipes = (await api("/api/admin/recipes")).recipes; } catch(_){}
   }
@@ -476,21 +650,43 @@ async function loadRecipeControl(){
     o.textContent = `${r.name}  ·  ${r.model||"custom"}  ·  saved`;
     sel.appendChild(o);
   });
-  let rec;
-  try { rec = await api("/api/admin/recipe/current"); } catch(_){ rec = {}; }
+  const rec = info.recipe || {};
   const cur = $("ctl-current"), form = $("ctl-start-form");
-  if (rec.running) {
+  window._runningRecipe = rec.running ? rec.name : null;
+  if (eng.owner === "stack") {
+    const chips = (eng.containers || []).map(c =>
+      `<span class="chip">${c.node} · ${c.up ? "<b>up</b>" : `<span class="err">${c.status}</span>`}</span>`).join("");
+    cur.innerHTML = `Running: <b>${eng.label}</b> <span class="meta">engine stack · ${eng.up}/${eng.expected} containers${eng.model ? " · " + eng.model : ""}</span>
+      <div class="chips" style="margin-top:6px">${chips}</div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn danger" onclick="stackStop('${eng.name}', '${eng.label}')">Stop</button>
+        <button class="btn" onclick="stackRestart('${eng.name}', '${eng.label}')">Restart</button>
+      </div>`;
+    form.style.display = "";
+    $("ctl-start").textContent = "Start";
+    onCtlEngine();
+  } else if (eng.owner === "foreign") {
+    cur.innerHTML = `<span class="err">Something not managed here is answering the serving port.</span>
+      <div class="meta">Neither a sparkrun recipe nor a configured engine stack is running. Find and stop that process before starting anything.</div>`;
+    form.style.display = "";
+    $("ctl-start").textContent = "Start";
+    onCtlEngine();
+  } else if (rec.running) {
     cur.innerHTML = `Running: <b>${rec.name}</b> <span class="meta">(${rec.mode||"?"})</span>
       <div class="row" style="margin-top:10px">
         <button class="btn danger" onclick="ctlStop()">Stop</button>
         <button class="btn" onclick="ctlRestart()">Restart</button>
       </div>`;
-    form.style.display = "none";   // must stop first
+    // Keep the picker visible while running: browsing recipes must not
+    // require tearing down the live model. Starting becomes a switch.
+    form.style.display = "";
+    $("ctl-start").textContent = "Stop & switch";
+    onCtlEngine();
   } else {
     let last = {};
     try { last = await api("/api/admin/recipe/last"); } catch(_){}
     window._lastRecipe = last;
-    let html = `<span class="meta">No recipe running.</span>`;
+    let html = `<span class="meta">Nothing running — the serving port is free.</span>`;
     if (last && last.name){
       const m = nodeCount <= 1 ? "solo" : (last.mode || "cluster");
       html += `<div class="row" style="margin-top:10px">
@@ -499,9 +695,101 @@ async function loadRecipeControl(){
     }
     cur.innerHTML = html;
     form.style.display = "";
-    onCtlRecipe();
+    $("ctl-start").textContent = "Start";
+    onCtlEngine();
   }
   pollOp();
+}
+
+// Which engine's start form to show; the other engine's state gates it.
+function onCtlEngine(){
+  const pick = enginePick();
+  try { localStorage.setItem("sparkdash.engine", pick); } catch(_){}
+  const eng = window._engine || {owner:"none"};
+  const stackForm = $("ctl-stack-form"), recipeForm = $("ctl-start-form");
+  if (pick.startsWith("stack:")) {
+    stackForm.style.display = ""; recipeForm.style.display = "none";
+    loadStackForm(pick.slice(6));
+    return;
+  }
+  stackForm.style.display = "none"; recipeForm.style.display = "";
+  const blocked = eng.owner === "stack" ? `${eng.label} owns the serving port — stop it first.`
+                : eng.owner === "foreign" ? "An unmanaged process owns the serving port." : "";
+  $("ctl-start").disabled = !!blocked;
+  onCtlRecipe();
+  if (blocked) $("ctl-err").textContent = blocked;
+}
+
+async function loadStackForm(name){
+  const st = ctlStacks.find(s => s.name === name);
+  if (!st) return;
+  $("stack-desc").innerHTML = `<b>${st.label}</b> — started by <code>${st.command} start</code>, ` +
+    `${st.expected} containers (one per node)${st.model ? `, serves <b>${st.model}</b>` : ""}. ` +
+    `Start blocks until the engine is healthy, then runs its warm-up.`;
+  $("stack-err").textContent = "";
+  $("stack-preflight").textContent = "checking…";
+  $("stack-start").disabled = true;
+  try {
+    const p = await api(`/api/admin/stack/${encodeURIComponent(name)}/preflight`);
+    if (p.ok) {
+      $("stack-preflight").innerHTML = `<span class="badge custom">ready</span> port free, all nodes online`;
+      $("stack-start").disabled = false;
+    } else {
+      $("stack-preflight").innerHTML = p.problems.map(x => `<span class="err">${x}</span>`).join("<br>");
+    }
+  } catch(e){ $("stack-preflight").innerHTML = `<span class="err">${e.message}</span>`; }
+}
+
+async function stackStart(){
+  const name = enginePick().slice(6);
+  const st = ctlStacks.find(s => s.name === name) || {label:name};
+  if (!confirm(`Start ${st.label}? This takes several minutes (boot + warm-up).`)) return;
+  $("stack-err").textContent = "";
+  try {
+    await api(`/api/admin/stack/${encodeURIComponent(name)}/start`, {method:"POST"});
+    pollOp(true);
+  } catch(e){ $("stack-err").textContent = e.message; }
+}
+async function stackStop(name, label){
+  if (!confirm(`Stop ${label}? This tears down the live model on every node.`)) return;
+  try { await api(`/api/admin/stack/${encodeURIComponent(name)}/stop`, {method:"POST"}); pollOp(true); }
+  catch(e){ alert(e.message); }
+}
+async function stackRestart(name, label){
+  if (!confirm(`Restart ${label}? It will be unavailable for several minutes.`)) return;
+  try { await api(`/api/admin/stack/${encodeURIComponent(name)}/restart`, {method:"POST"}); pollOp(true); }
+  catch(e){ alert(e.message); }
+}
+
+// -- watchdog ---------------------------------------------------------------
+async function refreshWatchdog(){
+  try {
+    const w = await api("/api/admin/watchdog");
+    const s = w.state || {};
+    const fmt = t => t ? new Date(t*1000).toLocaleTimeString() : "never";
+    $("wd-enabled").checked = !!w.enabled;
+    $("wd-enabled").disabled = !!w.locked;
+    $("wd-status").innerHTML =
+      `${w.enabled ? "<b>Enabled</b>" : "<b>Disabled</b>"}${w.locked ? " (fixed by host config)" : ""}` +
+      `${w.auto_restart ? "" : " · alert only (auto-restart off)"}` +
+      ` · guarding: <b>${s.guarding || "nothing"}</b>` +
+      `<br>last check ${fmt(s.last_check)}: ${s.last_status || "—"}` +
+      `<br>failures ${s.failures || 0}/${w.fail_threshold} · automatic restarts ${s.restarts || 0}` +
+      ` (last ${fmt(s.last_restart)}) · cooldown ${w.restart_cooldown_min} min · startup grace ${w.startup_grace_min} min`;
+  } catch(e){ $("wd-status").textContent = e.message; }
+}
+async function wdToggle(){
+  $("wd-err").textContent = "";
+  try {
+    await api("/api/admin/watchdog", {method:"PUT", headers:{"content-type":"application/json"},
+      body: JSON.stringify({enabled: $("wd-enabled").checked})});
+  } catch(e){ $("wd-err").textContent = e.message; }
+  refreshWatchdog();
+}
+async function wdCheck(){
+  $("wd-status").textContent = "checking…";
+  try { await api("/api/admin/watchdog/check", {method:"POST"}); } catch(e){ $("wd-err").textContent = e.message; }
+  refreshWatchdog();
 }
 
 async function ctlStartLast(){
@@ -552,10 +840,15 @@ async function ctlStart(){
   const mode = document.querySelector('input[name=ctlmode]:checked').value;
   $("ctl-err").textContent = "";
   if (!recipe){ $("ctl-err").textContent = "Choose a recipe."; return; }
-  if (!confirm(`Start ${recipe} in ${mode} mode?`)) return;
+  const running = window._runningRecipe;
+  const ask = running
+    ? `Stop ${running} and start ${recipe} in ${mode} mode? The live model goes down for the switch.`
+    : `Start ${recipe} in ${mode} mode?`;
+  if (!confirm(ask)) return;
   try {
     await api("/api/admin/recipe/start", {method:"POST",
-      headers:{"content-type":"application/json"}, body: JSON.stringify({recipe, mode})});
+      headers:{"content-type":"application/json"},
+      body: JSON.stringify({recipe, mode, switch: !!running})});
     pollOp(true);
   } catch(e){ $("ctl-err").textContent = e.message; }
 }
@@ -578,7 +871,8 @@ async function pollOp(force){
   const box = $("ctl-op");
   if (op.phase === "idle"){ box.style.display = "none"; lastOpActive = false; return; }
   box.style.display = "";
-  $("op-action").textContent = (op.action||"").toUpperCase();
+  $("op-action").textContent = (op.action||"").toUpperCase() +
+    (op.engine && op.engine.startsWith("stack:") ? ` · ${op.recipe || op.engine.slice(6)}` : (op.engine ? " · recipe" : ""));
   $("op-phase").textContent = op.phase || "";
   $("op-msg").textContent = op.error ? op.error : (op.message || "");
   $("op-msg").className = op.error ? "err" : "meta";
@@ -592,7 +886,7 @@ async function pollOp(force){
   } else if (lastOpActive){
     // just finished — notify + refresh current state once (avoids a poll↔reload loop)
     lastOpActive = false;
-    notify(op.phase === "done" ? "Recipe ready" : "Recipe op failed",
+    notify(op.phase === "done" ? "Engine ready" : "Engine op failed",
            `${(op.action||"").toUpperCase()}: ${op.error || op.message || ""}`);
     loadRecipeControl();
   }
@@ -619,11 +913,25 @@ async function loadRecipes(){
     const {recipes} = await api("/api/admin/recipes");
     const sel = $("recipe-select");
     sel.length = 1;
-    recipes.filter(runnableHere).sort((a,b)=>a.name.localeCompare(b.name)).forEach(r => {
+    const seen = new Set();
+    const add = (label, model) => {
+      if (!model || seen.has(model)) return;
+      seen.add(model);
       const o = document.createElement("option");
-      o.value = r.model;
-      o.textContent = `${r.name}  ·  ${r.model}` + (r.min_nodes>1?`  (${r.min_nodes} nodes)`:"");
+      o.value = model;
+      o.textContent = label;
       sel.appendChild(o);
+    };
+    recipes.filter(runnableHere).sort((a,b)=>a.name.localeCompare(b.name)).forEach(r =>
+      add(`${r.name}  ·  ${r.model}` + (r.min_nodes>1?`  (${r.min_nodes} nodes)`:""), r.model));
+    // Saved custom recipes (not in any registry) belong in the preload
+    // picker too — including their companion models (e.g. a spec drafter),
+    // so a pre-download is actually complete.
+    let saved = [];
+    try { saved = (await api("/api/admin/recipe/saved")).recipes; } catch(_){}
+    saved.forEach(r => {
+      add(`${r.name}  ·  ${r.model}  (saved)`, r.model);
+      (r.extra_models || []).forEach(m => add(`${r.name} — companion  ·  ${m}`, m));
     });
   } catch(_){}
 }

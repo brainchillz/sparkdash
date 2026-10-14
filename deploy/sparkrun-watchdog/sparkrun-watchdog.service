@@ -1,0 +1,14 @@
+[Unit]
+Description=sparkrun watchdog — relaunch a dead multi-node vLLM job
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nvidia
+Group=nvidia
+StateDirectory=sparkrun-watchdog
+Environment=HOME=/home/nvidia
+Environment=PATH=/home/nvidia/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/sparkrun-watchdog
+TimeoutStartSec=30min

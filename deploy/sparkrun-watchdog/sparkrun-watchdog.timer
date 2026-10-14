@@ -1,0 +1,11 @@
+[Unit]
+Description=Run sparkrun-watchdog every 2 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Unit=sparkrun-watchdog.service
+
+[Install]
+WantedBy=timers.target

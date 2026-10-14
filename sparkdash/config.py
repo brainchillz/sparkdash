@@ -147,6 +147,16 @@ _alerts = _cfg.get("alerts", {})
 ALERT_WEBHOOK = _alerts.get("webhook_url", "")
 ALERT_STYLE = _alerts.get("style", "json")          # "json" | "ntfy" | "gchat"
 
+# -- Download rate cap ----------------------------------------------------
+#
+# Cap internet-sourced ingress on the head while a model preload downloads,
+# so a 182 GB pull doesn't flatten the house uplink (LAN/RDMA/NFS traffic
+# is exempt). `download_cap_mbit` here locks the value (UI read-only);
+# leave it unset to manage the cap from the admin UI. `download_cap_iface`
+# overrides the WAN interface (default: the default-route device).
+DOWNLOAD_CAP_MBIT = int(_cfg.get("download_cap_mbit", 0) or 0)
+DOWNLOAD_CAP_IFACE = _cfg.get("download_cap_iface", "")
+
 # -- Peer installs --------------------------------------------------------
 #
 # Other SparkDash installs to summarise on the front page. Each: name, url
@@ -186,3 +196,58 @@ SPARKRUN_PYTHON = os.environ.get(
 BACKUP_DEFAULT_BASE = os.environ.get("SPARKDASH_BACKUP_BASE", "/mnt/llm")
 BACKUP_SUBDIR = "Sparkdash/Models"
 BACKUP_MANIFEST = "sparkdash-backup.json"
+
+# -- Engine stacks (inference engines launched outside sparkrun) ----------
+#
+# A stack is a set of containers (one per node) started by an operator script
+# rather than a sparkrun recipe — e.g. a hand-tuned vLLM build. SparkDash
+# detects it from its container-name prefix on every node, shows it as the
+# owner of the serving port, drives it through `command start|stop|restart`
+# (streamed into the same operation panel as recipes), refuses to start a
+# recipe on top of it (and vice versa), and the watchdog guards it the same
+# way it guards a recipe. The script must: start = launch and block until the
+# engine is healthy (exit non-zero otherwise); stop = tear down every
+# container; restart = both. One [[stacks]] block per stack:
+#
+#   [[stacks]]
+#   name    = "glm53k"                       # short id (container prefix sans '-')
+#   label   = "GLM-5.3-Flash (knapcio TP4)"  # shown in the UI
+#   command = "/usr/local/bin/glm"           # start|stop|restart|status|logs (not under a home dir)
+#   prefix  = "glm53k-"                      # container-name prefix on every node
+#   model   = "glm-5.3-flash"                # served model name (informational)
+#   head    = "glm53k-r0"                    # container whose logs to stream (default: <prefix>r0)
+#   stopped_marker = "/var/lib/glm/stopped"  # optional: present = stopped on purpose
+STACKS = []
+for _s in _cfg.get("stacks", []):
+    if not (_s.get("name") and _s.get("command") and _s.get("prefix")):
+        continue
+    STACKS.append({
+        "name": str(_s["name"]),
+        "label": str(_s.get("label") or _s["name"]),
+        "command": str(_s["command"]),
+        "prefix": str(_s["prefix"]),
+        "model": str(_s.get("model") or ""),
+        "head": str(_s.get("head") or f"{_s['prefix']}r0"),
+        "stopped_marker": str(_s.get("stopped_marker") or ""),
+        "expected": int(_s.get("expected") or len(NODES)),   # containers (one per node)
+    })
+
+# -- Watchdog (auto-recovery) --------------------------------------------
+#
+# Guards whatever engine owns the serving port — a sparkrun recipe or a
+# stack: every container up, /health answering past the startup grace, and
+# the model canary passing. After WATCHDOG_FAIL_THRESHOLD consecutive failing
+# checks it alerts (through the configured webhook), and when every node is
+# reachable and no automatic restart happened within the cooldown, restarts
+# the engine through the same operation path the admin UI uses. A deliberate
+# stop needs no marker: an engine that is no longer there is not guarded.
+# `enabled` here locks the setting (UI read-only); otherwise the admin UI
+# toggles it (stored in the settings table, default on).
+_wd = _cfg.get("watchdog", {})
+WATCHDOG_LOCKED = "enabled" in _wd
+WATCHDOG_ENABLED_DEFAULT = bool(_wd.get("enabled", True))
+WATCHDOG_INTERVAL = float(_wd.get("interval", 60) or 60)          # seconds between checks
+WATCHDOG_FAIL_THRESHOLD = int(_wd.get("fail_threshold", 2) or 2)  # consecutive failing checks
+WATCHDOG_GRACE_MIN = float(_wd.get("startup_grace_min", 30) or 30)  # a fresh engine may take this long
+WATCHDOG_COOLDOWN_MIN = float(_wd.get("restart_cooldown_min", 40) or 40)
+WATCHDOG_AUTO_RESTART = bool(_wd.get("auto_restart", True))        # false = alert only

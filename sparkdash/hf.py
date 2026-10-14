@@ -21,15 +21,66 @@ import fnmatch
 import json
 import os
 import re
+import signal
 import time
 from pathlib import Path
 
-from . import config
+from . import config, netcap
 
 HF_HUB = Path(os.path.expanduser("~/.cache/huggingface/hub"))
+#: The standard hf-CLI token location — huggingface_hub (and therefore
+#: sparkrun's download subprocess) reads it automatically, so managing this
+#: file is all the plumbing a gated-model download needs.
+TOKEN_FILE = Path(os.path.expanduser("~/.cache/huggingface/token"))
 
 _HEAD = next(n for n in config.NODES if n["local"])
 _WORKERS = [n for n in config.NODES if not n["local"]]
+
+
+# -- HF access token ---------------------------------------------------------
+
+def read_token() -> str | None:
+    try:
+        return TOKEN_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def token_status() -> dict:
+    tok = read_token()
+    masked = f"{tok[:6]}…{tok[-4:]}" if tok and len(tok) > 14 else None
+    return {"present": bool(tok), "masked": masked,
+            "env": bool(os.environ.get("HF_TOKEN"))}
+
+
+def save_token(tok: str) -> None:
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(tok + "\n")
+    TOKEN_FILE.chmod(0o600)
+
+
+def delete_token() -> bool:
+    try:
+        TOKEN_FILE.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+async def whoami(tok: str) -> tuple[str | None, str | None]:
+    """(account name, error) for a token, via the HF whoami API."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get("https://huggingface.co/api/whoami-v2",
+                                 headers={"Authorization": f"Bearer {tok}"})
+        if r.status_code == 200:
+            return r.json().get("name") or "?", None
+        if r.status_code in (401, 403):
+            return None, "Token rejected by huggingface.co"
+        return None, f"whoami returned HTTP {r.status_code}"
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def repo_dirname(repo_id: str) -> str:
@@ -200,13 +251,17 @@ class Preloader:
     async def cancel(self) -> None:
         self._cancel = True
         if self._proc and self._proc.returncode is None:
-            self._proc.terminate()
+            try:
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                self._proc.terminate()
 
     def _touch(self, **kw) -> None:
         self._state.update(kw)
         self._state["updated"] = time.time()
 
     async def _drive(self, model_ref: str, mirror: bool, existing: bool = False) -> None:
+        capped = False
         try:
             do_mirror = mirror and bool(_WORKERS)
             if existing:
@@ -237,13 +292,27 @@ class Preloader:
                     self._touch(active=False, phase="error", message="Failed",
                                 error=space)
                     return
+                cap = netcap.get_mbit()
+                if cap > 0:
+                    err = await netcap.apply(cap)
+                    if err:
+                        # Never block the download on the cap — surface and go.
+                        self._touch(cap_error=f"rate cap not applied: {err}")
+                    else:
+                        capped = True
+                        self._touch(cap_mbit=cap)
                 self._touch(total_bytes=total, file_count=nfiles,
                             phase="downloading",
-                            message=f"Downloading {nfiles} file(s) to {_HEAD['name']}")
+                            message=f"Downloading {nfiles} file(s) to {_HEAD['name']}"
+                                    + (f" (capped at {cap} Mbit/s)" if capped else ""))
 
             argv = self._build_cmd(model_ref, do_mirror)
+            # Own session: sparkrun's downloader spawns `hf download`
+            # grandchildren, and terminating only the wrapper orphans them —
+            # observed still pulling from the CDN (uncapped, into deleted
+            # inodes) long after a cancel. Cancel kills the whole group.
             self._proc = await asyncio.create_subprocess_exec(
-                *argv,
+                *argv, start_new_session=True,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
             await self._monitor(model_ref, total, do_mirror)
@@ -262,6 +331,13 @@ class Preloader:
         except Exception as exc:
             self._touch(active=False, phase="error",
                         error=f"{type(exc).__name__}: {exc}", message="Failed")
+        finally:
+            # Unconditional for fresh downloads: the cap may also have been
+            # applied or changed mid-flight from the admin UI, so tear down
+            # whatever is installed rather than only what we applied. A
+            # teardown with no cap present is a harmless no-op.
+            if not existing or capped:
+                await netcap.remove()
 
     def _build_cmd(self, model_ref: str, do_mirror: bool) -> list[str]:
         """A sparkrun-interpreter subprocess that reuses sparkrun's own code."""
@@ -292,8 +368,16 @@ class Preloader:
             if self._cancel:
                 return
             head = await _du_bytes(_HEAD, dirname)
-            self._state["head_bytes"] = head
-            head_done = total and head >= total * 0.999
+            # du counts in-flight *.incomplete partials, which are re-fetched
+            # bytes on a resume: raw du can exceed the logical total (seen:
+            # "192 of 185 GB") and would flip the phase to "mirroring" while
+            # shards are still downloading. Clamp the display, and only call
+            # the head done when no partial files remain.
+            partials = bool(next(
+                (HF_HUB / dirname / "blobs").glob("*.incomplete"), None)) \
+                if (HF_HUB / dirname / "blobs").is_dir() else False
+            self._state["head_bytes"] = min(head, total) if total else head
+            head_done = total and head >= total * 0.999 and not partials
             if do_mirror:
                 for w in _WORKERS:
                     wb = await _du_bytes(w, dirname)

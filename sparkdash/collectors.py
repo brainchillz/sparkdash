@@ -30,13 +30,24 @@ from . import config, engines
 # bytes, and list sparkrun containers (for orphan detection — a container
 # sparkrun no longer tracks still squats the port and unified memory).
 # Emitted as "<vram_mib>|<used_bytes>,<total_bytes>|<name,name,...>".
-_PROBE_CMD = (
-    "V=$(nvidia-smi --query-compute-apps=used_gpu_memory "
-    "--format=csv,noheader,nounits 2>/dev/null | awk '{s+=$1} END{print s+0}'); "
-    "D=$(df -B1 / | awk 'NR==2{print $3\",\"$2}'); "
-    "C=$(docker ps --format '{{.Names}}' 2>/dev/null | grep '^sparkrun_' "
-    "| paste -sd, -); echo \"$V|$D|$C\""
-)
+# A fourth field lists engine-stack containers (config.STACKS prefixes) in
+# every state with their status — "name=Up 5 minutes,name=Exited (0) 3 min…"
+# — so a stack with a dead rank is seen as such, not as absent.
+def _probe_cmd() -> str:
+    prefixes = "|".join(re.escape(st["prefix"]) for st in config.STACKS)
+    stack_part = (
+        "S=$(docker ps -a --format '{{.Names}}={{.Status}}' 2>/dev/null "
+        f"| grep -E '^({prefixes})' | paste -sd, -); " if prefixes else "S=; ")
+    return (
+        "V=$(nvidia-smi --query-compute-apps=used_gpu_memory "
+        "--format=csv,noheader,nounits 2>/dev/null | awk '{s+=$1} END{print s+0}'); "
+        "D=$(df -B1 / | awk 'NR==2{print $3\",\"$2}'); "
+        "C=$(docker ps --format '{{.Names}}' 2>/dev/null | grep '^sparkrun_' "
+        "| paste -sd, -); " + stack_part + "echo \"$V|$D|$C|$S\""
+    )
+
+
+_PROBE_CMD = _probe_cmd()
 
 
 class Hub:
@@ -212,17 +223,21 @@ class Hub:
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=8.0)
         text = out.decode(errors="replace").strip()
-        # Expected: "<vram_mib>|<used_bytes>,<total_bytes>|<container,...>"
-        # (the container field is absent from pre-update probes — tolerate it).
+        # Expected: "<vram_mib>|<used_bytes>,<total_bytes>|<container,...>|<name=status,...>"
+        # (later fields are absent from pre-update probes — tolerate it).
         try:
             vram_part, rest = text.split("|", 1)
-            disk_part, _, cont_part = rest.partition("|")
+            disk_part, _, rest = rest.partition("|")
+            cont_part, _, stack_part = rest.partition("|")
             used, total = disk_part.split(",", 1)
             self._probe[node["name"]] = {
                 "vram_used_mb": float(vram_part or 0),
                 "disk_used": int(used or 0),
                 "disk_total": int(total or 0),
                 "containers": [c for c in cont_part.split(",") if c],
+                "stack_containers": [
+                    {"name": c.split("=", 1)[0], "status": c.split("=", 1)[1]}
+                    for c in stack_part.split(",") if "=" in c],
             }
             self._probe_ts[node["name"]] = time.monotonic()
         except ValueError:
@@ -462,6 +477,45 @@ class Hub:
         self._canary = result
         return result
 
+    # -- engine ownership --------------------------------------------------
+
+    def _engine_state(self, rec: dict) -> dict:
+        """Which engine owns the serving port, from the status poll (recipes)
+        and the node probe (stacks)."""
+        from . import stacks   # local import: stacks imports nothing from here
+        found = [stacks.describe(st, self._probe) for st in config.STACKS]
+        present = [d for d in found if d["present"]]
+        recipe_running = bool(rec.get("running"))
+        base = {"owner": "none", "name": None, "label": None, "model": None,
+                "expected": 0, "up": 0, "containers": [], "youngest_min": None,
+                "log_container": None, "conflict": False,
+                "stacks": found}
+        if present:
+            d = present[0]
+            local = next((n["name"] for n in config.NODES if n["local"]), None)
+            head = next((c["name"] for c in d["containers"]
+                         if c["node"] == local and c["up"]), None)
+            base.update(owner="stack", name=d["name"], label=d["label"],
+                        model=d["model"], expected=d["expected"], up=d["up"],
+                        containers=d["containers"], youngest_min=d["youngest_min"],
+                        log_container=head,
+                        conflict=recipe_running and d["up"] > 0)
+            if recipe_running and not d["up"]:
+                # Only exited leftovers of the stack: the recipe is the owner.
+                base.update(owner="sparkrun", name=rec.get("name"),
+                            label=rec.get("name"), model=None,
+                            expected=0, up=0, containers=[], log_container=None)
+        elif recipe_running:
+            conts = rec.get("containers") or []
+            up = [c for c in conts if str(c.get("status", "")).startswith("Up")]
+            base.update(owner="sparkrun", name=rec.get("name"), label=rec.get("name"),
+                        expected=(1 if rec.get("solo") else
+                                  max((rec.get("tp") or 1) * (rec.get("pp") or 1), len(conts))),
+                        up=len(up))
+        elif self._vllm.get("healthy"):
+            base.update(owner="foreign", label="unmanaged process")
+        return base
+
     # -- merged snapshot ---------------------------------------------------
 
     def snapshot(self) -> dict:
@@ -515,10 +569,47 @@ class Hub:
         # don't run Ray, and its absence shouldn't read as "degraded".
         ray_ok = (not self._ray.get("reachable")) or (
             self._ray.get("nodes_alive") == self._ray.get("nodes_total"))
+        # The recipe's containers: a rebooted node loses its container while
+        # the other ranks and the API process stay up, so /health keeps
+        # answering 200 for a job that cannot serve a single request.
+        rec = self._recipe
+        recipe_expected = 0
+        recipe_up: list[dict] = []
+        recipe_down: list[str] = []
+        if rec.get("running"):
+            conts = rec.get("containers") or []
+            recipe_expected = 1 if rec.get("solo") else max(
+                (rec.get("tp") or 1) * (rec.get("pp") or 1), len(conts))
+            recipe_up = [c for c in conts
+                         if str(c.get("status", "")).startswith("Up")]
+            recipe_down = [f"{c['role']}@{c['ip']} {c['status']}" for c in conts
+                           if c not in recipe_up]
+        recipe_ok = (not rec.get("running")) or len(recipe_up) >= recipe_expected
+
+        # Who owns the serving port: a sparkrun recipe, an engine stack
+        # (config.STACKS, detected from its containers on the nodes), something
+        # unmanaged ("foreign": /health answers but nothing we know is there),
+        # or nothing. Both at once is a conflict worth a banner.
+        engine = self._engine_state(rec)
+        stack_ok = (engine["owner"] != "stack") or engine["up"] >= engine["expected"]
+
+        # The canary is a real completion; a wedged engine fails it while
+        # still answering /health. Only counts once vLLM is otherwise up, so
+        # a model that is still loading reads as "unreachable", not "canary".
+        # "no model loaded" is the canary firing before the first vLLM poll
+        # (or with nothing served) — not a verdict on the model.
+        canary_ran = bool(self._canary) and \
+            self._canary.get("error") != "no model loaded"
+        canary_ok = not (self._vllm.get("healthy") and canary_ran
+                         and not self._canary.get("ok"))
+
         cluster_healthy = (
             self._vllm.get("healthy")
             and all(nd["online"] for nd in nodes)
             and ray_ok
+            and recipe_ok
+            and stack_ok
+            and canary_ok
         )
 
         # WHY unhealthy — every component of the verdict, in plain words, so
@@ -537,6 +628,24 @@ class Hub:
         if not ray_ok:
             reasons.append(f"Ray: {self._ray.get('nodes_alive')}/"
                            f"{self._ray.get('nodes_total')} nodes alive")
+        if not recipe_ok:
+            missing = recipe_expected - len(recipe_up)
+            reasons.append(
+                f"recipe {rec.get('name')}: {len(recipe_up)}/{recipe_expected} "
+                f"containers up ({missing} missing"
+                + (f"; down: {', '.join(recipe_down)}" if recipe_down else "")
+                + ")")
+        if not stack_ok:
+            down = [f"{c['name']}@{c['node']} {c['status']}"
+                    for c in engine["containers"] if not c["up"]]
+            missing = engine["expected"] - engine["up"]
+            reasons.append(
+                f"stack {engine['label']}: {engine['up']}/{engine['expected']} "
+                f"containers up ({missing} missing"
+                + (f"; down: {', '.join(down)}" if down else "") + ")")
+        if not canary_ok:
+            reasons.append("model canary failed: "
+                           + str(self._canary.get("error", "incoherent reply")))
 
         # Non-fatal but worth a banner: failing collectors, orphan containers,
         # a canary that last failed.
@@ -544,9 +653,20 @@ class Hub:
         for nd in nodes:
             for c in nd["orphan_containers"]:
                 warnings.append(f"node {nd['name']}: orphan container {c}")
-        if self._canary and not self._canary.get("ok"):
+        if (self._canary and not self._canary.get("ok")
+                and not self._vllm.get("healthy")):
+            # vLLM is down anyway; keep the canary detail visible as a warning
+            # rather than a second health reason.
             warnings.append("model canary failed: "
                             + str(self._canary.get("error", "incoherent reply")))
+        if engine.get("conflict"):
+            warnings.append("both a sparkrun recipe and the "
+                            f"{engine['label']} stack have containers up — "
+                            "they are fighting over the GPUs; stop one")
+        if engine["owner"] == "foreign":
+            warnings.append("the serving port answers /health but neither a "
+                            "sparkrun recipe nor a configured stack is running "
+                            "— an unmanaged process owns it")
         sd = self._vllm.get("spec_decode") or {}
         if sd.get("collapsed"):
             warnings.append(
@@ -564,6 +684,7 @@ class Hub:
             "ray": self._ray,
             "vllm": self._vllm,
             "recipe": self._recipe,
+            "engine": engine,
             "nodes": nodes,
             "canary": self._canary,
             "peers": sorted(self._peers.values(), key=lambda p: p["name"]),

@@ -1,5 +1,5 @@
 [Unit]
-Description=SparkDash — read-only dashboard for the sparkrun DGX Spark cluster
+Description=SparkDash — dashboard, engine control and watchdog for the DGX Spark cluster
 Documentation=https://github.com/brainchillz/sparkdash
 # Ray's dashboard is bound to 127.0.0.1 on the head node, and the collectors
 # SSH to both nodes, so the network must be up first. docker is where the
@@ -41,6 +41,10 @@ KillSignal=SIGINT
 
 # Light hardening (kept loose: the service legitimately spawns ssh/nvidia-smi).
 NoNewPrivileges=true
+# The download rate cap (netcap.py) shapes ingress with tc, which needs
+# CAP_NET_ADMIN. NoNewPrivileges blocks sudo inside the service, so grant the
+# capability directly — tighter than sudoers, and the hardening stays.
+AmbientCapabilities=CAP_NET_ADMIN
 ProtectSystem=full
 ProtectControlGroups=true
 ProtectKernelTunables=true

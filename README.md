@@ -316,12 +316,16 @@ sparkdash/certs.py       self-signed generation, validation, anti-lockout
 sparkdash/hf.py          model preload + RDMA mirror (reuses sparkrun's code)
 sparkdash/backup.py      model backup/restore to a shared location (rsync)
 sparkdash/recipe_ops.py  recipe start/stop/restart (reuses sparkrun's tooling)
-sparkdash/logstream.py   live vLLM container-log streaming
+sparkdash/stacks.py      engine stacks: detection, pre-flight, start/stop/restart via script
+sparkdash/ops.py         the one-at-a-time operation state shared by recipes and stacks
+sparkdash/watchdog.py    auto-recovery for the engine that owns the port (recipe or stack)
+sparkdash/alerts.py      push alerts on state transitions (webhook: json/ntfy/gchat)
+sparkdash/logstream.py   live container-log streaming (recipe head / stack rank 0)
 sparkdash/chat.py        streaming chat proxy to the running model
 sparkdash/admin.py       `set-password` CLI
 frontend/index.html      dashboard page (read-only)
 frontend/history.html    historic-metrics popout (uPlot charts, range picker)
-frontend/admin.html      full-page admin (login, models, tokens, cert)
+frontend/admin.html      full-page admin (engine control, models, chat, settings)
 frontend/app.css         shared stylesheet
 frontend/vendor/         vendored uPlot (no CDN dependency)
 deploy/install.sh        deploy to /opt/sparkdash + enable the systemd service
@@ -379,17 +383,55 @@ Endpoints (all `require_admin`): `GET/POST /api/admin/backup/target`,
 `POST /api/admin/backup/verify`, `POST /api/admin/backup/delete`,
 `GET /api/admin/backup/status`, `POST /api/admin/backup/cancel`.
 
-## Recipe control
+## Engine control
 
-**Admin → Recipe Control** starts, stops, and restarts recipes, wrapping
-sparkrun's own tooling. Topology is gated by the recipe's `min_nodes`: pick
-**single node** (`--solo`) or **cluster** (`--cluster`); recipes needing ≥2
-nodes force cluster. A dry-run **VRAM pre-flight** shows whether the model fits
-before you commit. Start is blocked while a recipe runs (stop first); one
-operation at a time, with live streamed output. Restart captures the exact
-running config (`export running-recipe`) so it reproduces precisely. All
-endpoints are `require_admin`. Endpoints: `GET /api/admin/recipe/current`,
-`POST …/recipe/{preflight,start,stop,restart}`, `GET …/recipe/op`.
+**Admin → Engine** starts, stops, and restarts whatever serves the model.
+Two kinds of engine are supported, and exactly one may own the serving port
+at a time:
+
+* **sparkrun recipes** — wrapping sparkrun's own tooling. Topology is gated
+  by the recipe's `min_nodes`: pick **single node** (`--solo`) or **cluster**
+  (`--cluster`); recipes needing ≥2 nodes force cluster. A dry-run **VRAM
+  pre-flight** shows whether the model fits before you commit. Restart
+  captures the exact running config (`export running-recipe`) so it
+  reproduces precisely. Starting while a recipe runs becomes a stop-and-switch.
+* **engine stacks** (`[[stacks]]` in config.toml) — inference engines
+  launched outside sparkrun by an operator script, e.g. a hand-tuned vLLM
+  build with one container per node. SparkDash detects a stack from its
+  container-name prefix on every node (so one started on the console shows
+  up too), drives it through `command start|stop|restart`, streams the
+  script's output into the same operation panel, and reads logs from its
+  rank-0 container. The script's contract: `start` launches every rank and
+  blocks until the engine is healthy (non-zero exit otherwise), `stop` tears
+  down every container, `restart` does both.
+
+A recipe cannot be started while a stack owns the port and vice versa (HTTP
+409 naming the owner); a port answered by something neither kind describes
+is shown as an **unmanaged process** and also blocks starts. One operation at
+a time across both kinds, with live streamed output. All endpoints are
+`require_admin`: `GET /api/admin/engine` (owner + stacks + running recipe),
+`GET /api/admin/recipe/current`, `POST …/recipe/{preflight,start,stop,restart}`,
+`GET …/recipe/op` (the shared operation), `GET …/stack/{name}/preflight`,
+`POST …/stack/{name}/{start,stop,restart}`.
+
+## Watchdog (auto-recovery)
+
+A background check every minute guards whichever engine owns the port — a
+recipe or a stack, the same way: every expected container is `Up`, `/health`
+answers once the engine is past the startup grace (30 min), and the periodic
+model canary passed. After two consecutive failing checks it alerts through
+the push-alert webhook; then, when every node is online, no operation is in
+progress and no automatic restart happened within the cooldown (40 min), it
+restarts the engine through the same controller the UI uses, so the restart
+is visible in Engine Control with streamed output. Nothing running means
+nothing guarded, so a deliberate stop is never undone and no marker file is
+needed. **Admin → Settings → Auto-recovery Watchdog** shows the last verdict
+and toggles it; a `[watchdog]` table in config.toml fixes the setting and
+tunes the interval, threshold, grace, cooldown and `auto_restart = false`
+(alert only). Endpoints: `GET/PUT /api/admin/watchdog`, `POST …/watchdog/check`.
+
+This replaces the standalone `deploy/sparkrun-watchdog` timer (which only
+knew about sparkrun jobs); disable that timer where it was installed.
 
 ## Features
 

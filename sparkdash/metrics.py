@@ -96,6 +96,16 @@ def render_prometheus(snap: dict) -> str:
                 "Running recipe as labels (value always 1).",
                 labels={"name": recipe.get("name", ""), "tp": recipe.get("tp", "")})
 
+    eng = snap.get("engine") or {}
+    doc.add("sparkdash_engine_info", 1,
+            "Owner of the serving port as labels: owner = sparkrun|stack|foreign|none.",
+            labels={"owner": eng.get("owner", "none"), "name": eng.get("name") or ""})
+    if eng.get("owner") in ("sparkrun", "stack"):
+        doc.add("sparkdash_engine_containers_up", eng.get("up"),
+                "Engine containers currently Up.")
+        doc.add("sparkdash_engine_containers_expected", eng.get("expected"),
+                "Engine containers expected (one per rank).")
+
     for n in snap.get("nodes", []):
         lb = {"node": n["name"], "role": n["role"]}
         doc.add("sparkdash_node_online", n.get("online"),

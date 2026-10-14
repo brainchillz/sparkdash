@@ -65,6 +65,32 @@ ips       = ["127.0.0.1"]
 #webhook_url = "https://ntfy.example.net/sparkdash"
 #style       = "ntfy"
 
+# Optional: engine stacks — inference engines launched outside sparkrun by an
+# operator script (e.g. a hand-tuned vLLM build, one container per node).
+# SparkDash detects the stack from its container-name prefix on every node,
+# shows it as the owner of the serving port, drives it with
+# `command start|stop|restart` (start must block until healthy and exit
+# non-zero otherwise; stop must remove every container), streams the script's
+# output into the operation panel, refuses to start a recipe on top of it (and
+# vice versa), and the watchdog guards it like a recipe. One block per stack.
+#[[stacks]]
+#name    = "glm53k"                        # short id
+#label   = "GLM-5.3-Flash (knapcio TP4)"   # shown in the UI
+#command = "/usr/local/bin/glm"            # start|stop|restart (keep it outside any home directory)
+#prefix  = "glm53k-"                       # container-name prefix on every node
+#model   = "glm-5.3-flash"                 # served model name (informational)
+#head    = "glm53k-r0"                     # container to stream logs from (default <prefix>r0)
+
+# Optional: auto-recovery watchdog (default: enabled, managed from the admin
+# UI). Setting `enabled` here locks it. See README "Watchdog".
+#[watchdog]
+#enabled = true
+#interval = 60                 # seconds between checks
+#fail_threshold = 2            # consecutive failing checks before acting
+#startup_grace_min = 30        # a fresh engine may take this long to answer /health
+#restart_cooldown_min = 40     # minimum gap between automatic restarts
+#auto_restart = true           # false = alert only
+
 # Optional: other SparkDash installs to summarise on the front page.
 #[[peers]]
 #name = "pebbless"

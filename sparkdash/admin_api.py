@@ -21,7 +21,8 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from . import alerts, auth, backup, certs, chat, config, hf, recipe_ops, sso, store
+from . import (alerts, auth, backup, certs, chat, config, hf, netcap, recipe_ops,
+               sso, stacks, store, watchdog)
 
 router = APIRouter()
 
@@ -48,6 +49,7 @@ class PreloadBody(BaseModel):
 class StartBody(BaseModel):
     recipe: str
     mode: str = "cluster"   # "solo" | "cluster"
+    switch: bool = False    # stop whatever is running first, then start
 
 
 class PreflightBody(BaseModel):
@@ -219,6 +221,88 @@ async def alerts_disable() -> dict:
 async def alerts_test() -> dict:
     err = await alerts.send_test()
     return {"ok": err is None, "error": err}
+
+
+# -- download rate cap (settings surface; enforcement lives in netcap.py) ----
+
+class NetcapBody(BaseModel):
+    mbit: int
+
+
+def _preload_downloading() -> bool:
+    s = hf.preloader.status()
+    return bool(s.get("active")) and s.get("phase") == "downloading"
+
+
+@router.get("/api/admin/netcap", dependencies=[auth.SessionDep])
+async def netcap_status() -> dict:
+    return {
+        "mbit": netcap.get_mbit(),
+        "locked": netcap.locked(),
+        "live": await netcap.active(),
+    }
+
+
+@router.put("/api/admin/netcap", dependencies=[auth.SessionDep])
+async def netcap_set(body: NetcapBody) -> dict:
+    if netcap.locked():
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "Download cap is fixed by host configuration")
+    if not netcap.MIN_MBIT <= body.mbit <= netcap.MAX_MBIT:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"mbit must be {netcap.MIN_MBIT}-{netcap.MAX_MBIT}")
+    netcap.save_stored(body.mbit)
+    err = None
+    if _preload_downloading():  # re-shape the running download immediately
+        err = await netcap.apply(body.mbit)
+    return {"ok": err is None, "error": err, "mbit": netcap.get_mbit(),
+            "live": await netcap.active()}
+
+
+@router.delete("/api/admin/netcap", dependencies=[auth.SessionDep])
+async def netcap_disable() -> dict:
+    if netcap.locked():
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "Download cap is fixed by host configuration")
+    removed = netcap.clear_stored()
+    if _preload_downloading():  # lift it from the running download too
+        await netcap.remove()
+    return {"ok": True, "removed": removed, "live": await netcap.active()}
+
+
+# -- Hugging Face access token -----------------------------------------------
+#
+# Written to ~/.cache/huggingface/token on the head — the standard hf-CLI
+# location, which huggingface_hub (and so sparkrun's download subprocess)
+# reads automatically. Needed for gated models (Llama…). Only ever echoed
+# back masked; validated against the HF whoami API before saving.
+
+class HfTokenBody(BaseModel):
+    token: str
+
+
+@router.get("/api/admin/hftoken", dependencies=[auth.SessionDep])
+async def hftoken_status() -> dict:
+    return hf.token_status()
+
+
+@router.put("/api/admin/hftoken", dependencies=[auth.SessionDep])
+async def hftoken_set(body: HfTokenBody) -> dict:
+    tok = body.token.strip()
+    if not tok or any(c.isspace() for c in tok):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "That doesn't look like a token")
+    account, err = await hf.whoami(tok)
+    if err:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, err)
+    hf.save_token(tok)
+    return {"ok": True, "account": account, **hf.token_status()}
+
+
+@router.delete("/api/admin/hftoken", dependencies=[auth.SessionDep])
+async def hftoken_remove() -> dict:
+    return {"ok": True, "removed": hf.delete_token(), **hf.token_status()}
 
 
 # -- API tokens --------------------------------------------------------------
@@ -475,17 +559,39 @@ async def recipe_preflight(body: PreflightBody) -> dict:
     return await recipe_ops.preflight(body.recipe.strip(), body.mode)
 
 
+def _refuse_if_port_owned_elsewhere(request: Request) -> None:
+    """A recipe must not be started on top of an engine stack (or an
+    unmanaged process): the GPUs are already taken and the port is busy."""
+    eng = request.app.state.hub.snapshot().get("engine") or {}
+    if eng.get("owner") == "stack":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"The {eng.get('label')} stack owns the serving port "
+            f"({eng.get('up')}/{eng.get('expected')} containers) — stop it first")
+    if eng.get("owner") == "foreign":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Something not managed here is answering the serving port — "
+            "find and stop it first")
+
+
 @router.post("/api/admin/recipe/start", dependencies=[auth.AdminDep])
-async def recipe_start(body: StartBody) -> dict:
+async def recipe_start(body: StartBody, request: Request) -> dict:
     recipe = body.recipe.strip()
     if not recipe:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Recipe required")
+    _refuse_if_port_owned_elsewhere(request)
     current = await recipe_ops.current_recipe()
-    if current.get("running"):
-        raise HTTPException(status.HTTP_409_CONFLICT,
-                            "A recipe is already running — stop it first")
     try:
-        recipe_ops.controller.start(recipe, body.mode)
+        if current.get("running"):
+            if not body.switch:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "A recipe is already running — stop it first, or pass "
+                    "switch: true to stop-and-start in one operation")
+            recipe_ops.controller.switch(recipe, body.mode)
+        else:
+            recipe_ops.controller.start(recipe, body.mode)
     except RuntimeError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     return {"ok": True, "op": recipe_ops.controller.status()}
@@ -512,3 +618,90 @@ async def recipe_restart(body: RestartBody) -> dict:
 @router.get("/api/admin/recipe/op", dependencies=[auth.AdminDep])
 async def recipe_op() -> dict:
     return recipe_ops.controller.status()
+
+
+# -- engine stacks (operational write) --------------------------------------
+
+@router.get("/api/admin/engine", dependencies=[auth.AdminDep])
+async def engine_state(request: Request) -> dict:
+    """Who owns the serving port (recipe / stack / foreign / none), the
+    configured stacks, and the running recipe — one call for the control tab."""
+    snap = request.app.state.hub.snapshot()
+    rec = await recipe_ops.current_recipe()
+    return {
+        "engine": snap.get("engine"),
+        "recipe": rec,
+        "stacks": [{k: st[k] for k in ("name", "label", "model", "command", "expected")}
+                   for st in config.STACKS],
+        "op": recipe_ops.controller.status(),
+    }
+
+
+def _stack_or_404(name: str) -> dict:
+    st = stacks.get(name)
+    if not st:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No stack named {name!r}")
+    return st
+
+
+@router.get("/api/admin/stack/{name}/preflight", dependencies=[auth.AdminDep])
+async def stack_preflight(name: str, request: Request) -> dict:
+    return await stacks.preflight(_stack_or_404(name), request.app.state.hub.snapshot())
+
+
+@router.post("/api/admin/stack/{name}/start", dependencies=[auth.AdminDep])
+async def stack_start(name: str, request: Request) -> dict:
+    st = _stack_or_404(name)
+    pf = await stacks.preflight(st, request.app.state.hub.snapshot())
+    if not pf["ok"]:
+        raise HTTPException(status.HTTP_409_CONFLICT, "; ".join(pf["problems"]))
+    try:
+        stacks.controller.start(st)
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    return {"ok": True, "op": stacks.controller.status()}
+
+
+@router.post("/api/admin/stack/{name}/stop", dependencies=[auth.AdminDep])
+async def stack_stop(name: str) -> dict:
+    try:
+        stacks.controller.stop(_stack_or_404(name))
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    return {"ok": True, "op": stacks.controller.status()}
+
+
+@router.post("/api/admin/stack/{name}/restart", dependencies=[auth.AdminDep])
+async def stack_restart(name: str) -> dict:
+    try:
+        stacks.controller.restart(_stack_or_404(name))
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    return {"ok": True, "op": stacks.controller.status()}
+
+
+# -- watchdog ---------------------------------------------------------------
+
+class WatchdogBody(BaseModel):
+    enabled: bool
+
+
+@router.get("/api/admin/watchdog", dependencies=[auth.AdminDep])
+async def watchdog_status() -> dict:
+    return watchdog.status()
+
+
+@router.put("/api/admin/watchdog", dependencies=[auth.SessionDep])
+async def watchdog_set(body: WatchdogBody) -> dict:
+    if config.WATCHDOG_LOCKED:
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "The watchdog is fixed by host configuration")
+    watchdog.set_enabled(body.enabled)
+    return watchdog.status()
+
+
+@router.post("/api/admin/watchdog/check", dependencies=[auth.AdminDep])
+async def watchdog_check(request: Request) -> dict:
+    """Run one watchdog pass now (it still honours the failure threshold)."""
+    await watchdog.check(request.app.state.hub)
+    return watchdog.status()
