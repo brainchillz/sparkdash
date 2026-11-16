@@ -316,6 +316,7 @@ sparkdash/certs.py       self-signed generation, validation, anti-lockout
 sparkdash/hf.py          model preload + RDMA mirror (reuses sparkrun's code)
 sparkdash/backup.py      model backup/restore to a shared location (rsync)
 sparkdash/recipe_ops.py  recipe start/stop/restart (reuses sparkrun's tooling)
+sparkdash/launch.py      launch watch: serve log + serve PID inside the head container
 sparkdash/stacks.py      engine stacks: detection, pre-flight, start/stop/restart via script
 sparkdash/ops.py         the one-at-a-time operation state shared by recipes and stacks
 sparkdash/watchdog.py    auto-recovery for the engine that owns the port (recipe or stack)
@@ -414,6 +415,46 @@ a time across both kinds, with live streamed output. All endpoints are
 `GET …/recipe/op` (the shared operation), `GET …/stack/{name}/preflight`,
 `POST …/stack/{name}/{start,stop,restart}`.
 
+## Launch watch
+
+`sparkrun run --no-follow` returns as soon as the containers exist, and each
+container is `sleep infinity` with vLLM started by a detached `docker exec`
+writing to `/tmp/sparkrun_serve.log` *inside* the container. When vLLM dies
+or hangs during startup the container stays "Up", `sparkrun status` says
+running, and `docker logs` shows only Ray — so anything that merely polls
+`/health` waits forever. Every "start last hung" episode since 2026-07 was
+this blind spot.
+
+A start / restart from the admin UI therefore follows the launch itself
+(`sparkdash/launch.py`): the serve log is streamed into the operation panel,
+the serve PID is checked every poll, and the operation **fails fast** when
+
+- the vLLM process has exited (container still up),
+- the head container is gone / sparkrun no longer lists the job,
+- the log shows a fatal error (`EngineDeadError`, CUDA errors, `Address
+  already in use`, argparse failures, NCCL faults, …) and then goes silent, or
+- the log has not grown for `stall_min` (default 10) while `/health` fails.
+
+A launch that keeps logging (weights, graph capture) may take up to `max_min`
+(default 45), so a cold start is not a timeout. On failure the last log lines
+go into the operation record and the alert webhook, **every rank's log is
+saved** to `/var/lib/sparkdash/launch-logs/` (`sparkrun logs -a`) before the
+dead job is stopped — the stop removes the containers and with them the only
+copy of the traceback — and the cluster is left clean for a retry. Stops and
+restarts of an unhealthy engine save the logs the same way.
+
+Two related fixes: the watchdog's startup grace no longer covers a sparkrun
+job whose serve process is already dead, and the **Start last** pointer is
+refreshed from whatever job is actually running (saved recipe file or
+`@registry/name`), not only on a sparkdash-initiated stop — a reboot or CLI
+launch used to leave it pointing at a stale file.
+
+```toml
+[launch]
+stall_min = 10
+max_min   = 45
+```
+
 ## Watchdog (auto-recovery)
 
 A background check every minute guards whichever engine owns the port — a
@@ -425,7 +466,10 @@ consecutive failing checks it alerts through
 the push-alert webhook; then, when every node is online, no operation is in
 progress and no automatic restart happened within the cooldown (40 min), it
 restarts the engine through the same controller the UI uses, so the restart
-is visible in Engine Control with streamed output. Nothing running means
+is visible in Engine Control with streamed output. A sparkrun recipe is only
+restarted once that launch has been seen serving; a launch that never became
+healthy is alerted on and left alone, because relaunching it would repeat
+whatever made it fail (stacks are always restarted). Nothing running means
 nothing guarded, so a deliberate stop is never undone and no marker file is
 needed. **Admin → Settings → Auto-recovery Watchdog** shows the last verdict
 and toggles it; a `[watchdog]` table in config.toml fixes the setting and

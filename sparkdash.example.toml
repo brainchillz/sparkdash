@@ -91,6 +91,14 @@ ips       = ["127.0.0.1"]
 #restart_cooldown_min = 40     # minimum gap between automatic restarts
 #auto_restart = true           # false = alert only
 
+# Optional: launch watch. A start/restart from the admin UI follows the vLLM
+# serve log and serve PID inside the head container (not just /health), so a
+# launch that died or hung is reported with the log excerpt instead of
+# waiting out a fixed timeout. See README "Launch watch".
+#[launch]
+#stall_min = 10                # no serve-log output for this long + /health failing = hung
+#max_min = 45                  # ceiling for a launch that keeps logging (cold loads)
+
 # Optional: other SparkDash installs to summarise on the front page.
 #[[peers]]
 #name = "pebbless"

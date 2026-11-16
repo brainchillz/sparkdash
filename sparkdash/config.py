@@ -254,3 +254,11 @@ WATCHDOG_FAIL_THRESHOLD = int(_wd.get("fail_threshold", 2) or 2)  # consecutive 
 WATCHDOG_GRACE_MIN = float(_wd.get("startup_grace_min", 30) or 30)  # a fresh engine may take this long
 WATCHDOG_COOLDOWN_MIN = float(_wd.get("restart_cooldown_min", 40) or 40)
 WATCHDOG_AUTO_RESTART = bool(_wd.get("auto_restart", True))        # false = alert only
+
+# Launch watch: a sparkdash-driven start/restart follows the serve log and the
+# serve PID inside the head container instead of only polling /health (see
+# launch.py). A launch that logs nothing for stall_min while /health fails is
+# called dead; one that keeps logging may take up to max_min.
+_launch = _cfg.get("launch", {}) or {}
+LAUNCH_STALL_MIN = float(_launch.get("stall_min", 10) or 10)
+LAUNCH_MAX_MIN = float(_launch.get("max_min", 45) or 45)

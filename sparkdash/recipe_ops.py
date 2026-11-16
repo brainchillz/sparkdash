@@ -23,10 +23,9 @@ import time
 
 import httpx
 
-from . import config, ops
+from . import alerts, config, launch, ops
 from .collectors import _parse_status
 
-_HEALTH_TIMEOUT = 20 * 60   # allow big models time to load weights
 
 # sparkrun labels a workload with the recipe argument, so restart re-runs from a
 # file named after the model to keep the dashboard name clean and stable.
@@ -52,11 +51,46 @@ def last_recipe() -> dict:
     try:
         with open(_LAST_FILE) as fh:
             info = json.load(fh)
-        if info.get("path") and os.path.isfile(info["path"]):
+        path = info.get("path") or ""
+        if path.startswith("@") or (path and os.path.isfile(path)):
             return info
     except (OSError, ValueError):
         pass
     return {}
+
+
+def note_running(rec: dict) -> None:
+    """Point "start last" at whatever is actually running.
+
+    `_preserve()` only writes the pointer on a sparkdash-initiated stop, so a
+    reboot or a CLI launch left it stale — on 2026-10-12 "start last" ran a
+    month-old recipe that no longer launched. Called by the status collector
+    whenever a new job id appears: a job named after a saved recipe file
+    points at that file; a registry recipe (@owner/name) is stored as its
+    ref, which `sparkrun run` accepts directly. Unknown names leave the
+    pointer alone.
+    """
+    name = rec.get("name") or ""
+    if not name:
+        return
+    if name.startswith("@"):
+        path = name
+    else:
+        path = f"{_SAVED_DIR}/{name}.yaml"
+        if not os.path.isfile(path):
+            path = f"{_SAVED_DIR}/{name}.yml"
+            if not os.path.isfile(path):
+                return
+    mode = rec.get("mode") or (
+        "solo" if rec.get("solo") or len(rec.get("containers") or []) == 1
+        else "cluster")
+    cur = last_recipe()
+    if cur.get("path") == path and cur.get("mode") == mode:
+        return
+    model = _read_model(path) if not path.startswith("@") else ""
+    _save_last(name, path, mode, model)
+    print(f"[sparkdash] start-last now points at {path} (running job {rec.get('id')})",
+          flush=True)
 
 
 def saved_recipes() -> list[dict]:
@@ -232,24 +266,83 @@ class RecipeController:
     async def _stream(self, argv: list[str]) -> int:
         return await ops.state.stream(argv)
 
-    async def _wait_healthy(self) -> bool:
-        self._touch(phase="loading", message="Waiting for vLLM to become healthy…")
-        deadline = time.time() + _HEALTH_TIMEOUT
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            while time.time() < deadline:
-                try:
-                    r = await client.get(f"{config.VLLM_BASE}/health")
-                    if r.status_code == 200:
-                        return True
-                except Exception:
-                    pass
-                await asyncio.sleep(5.0)
+    def _last_error_line(self) -> str:
+        """The most recent error-ish line sparkrun printed, for the verdict —
+        'exited 1' alone sends the reader back to the scrollback."""
+        for line in reversed(ops.state.status().get("output", [])):
+            if re.search(r"error|failed|aborting|refused|not found|CRITICAL",
+                         line, re.I) and not line.startswith("$ "):
+                return line.strip()[:200]
+        return "sparkrun run failed (see output)"
+
+    async def _await_job(self) -> dict:
+        """The job `sparkrun run` just created (status may lag a few seconds)."""
+        for _ in range(4):
+            rec = await current_recipe()
+            if rec.get("running"):
+                return rec
+            await asyncio.sleep(4.0)
+        return {}
+
+    async def _wait_ready(self, rec: dict, what: str) -> bool:
+        """Follow the launch (serve log + serve PID + /health) and settle the
+        operation. On failure the logs are saved first, the job is stopped so
+        the cluster is clean for a retry, and an alert goes out."""
+        rid = rec.get("id")
+        if not rid:
+            self._finish(False, f"{what}: sparkrun run returned but no job is running",
+                         "no job after launch")
+            return False
+        ok, error, excerpt = await launch.watch(
+            rid, self._emit, self._touch,
+            lambda: self._still_running(rid))
+        if ok:
+            return True
+        label = rec.get("name") or rid
+        self._touch(phase="failed", message="Launch failed — saving logs")
+        saved = await launch.save_logs(rid, label)
+        if saved:
+            self._emit(f"[sparkdash] full logs (all ranks) saved to {saved}")
+        if await self._still_running(rid):
+            self._emit("[sparkdash] stopping the dead job so a retry is possible")
+            await self._stream(["sparkrun", "stop", rid, "--cluster", config.SPARKRUN_CLUSTER])
+        tail = "\n".join(excerpt[-12:])
+        await alerts.send(f"launch failed: {label}",
+                          f"{error}\n\nlast serve-log lines:\n{tail}"
+                          + (f"\n\nfull logs: {saved}" if saved else ""))
+        self._finish(False, f"{what} failed: {error}", error)
         return False
+
+    async def _still_running(self, rid: str) -> bool:
+        try:
+            rec = await current_recipe()
+        except Exception:
+            return True   # unknown: don't call it dead on a status hiccup
+        return bool(rec.get("running")) and rec.get("id") == rid
+
+    async def _snapshot_logs_if_sick(self, rec: dict) -> None:
+        """Before a stop removes the containers: if vLLM is not healthy, keep
+        the logs — the watchdog's restarts used to destroy the only evidence."""
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                r = await client.get(f"{config.VLLM_BASE}/health")
+                if r.status_code == 200:
+                    return
+        except Exception:
+            pass
+        saved = await launch.save_logs(rec["id"], rec.get("name"))
+        if saved:
+            self._emit(f"[sparkdash] vLLM was not healthy — logs saved to {saved}")
 
     # -- operations -----------------------------------------------------------
 
     async def _do_start(self, recipe: str, mode: str) -> None:
         try:
+            if ("/" in recipe or recipe.endswith((".yaml", ".yml"))) \
+                    and not recipe.startswith("@") and not os.path.isfile(recipe):
+                self._finish(False, f"Start failed: recipe file not found: {recipe}",
+                             "recipe file missing")
+                return
             mode, note = _guard_mode(recipe, mode)
             if note:
                 self._emit(f"[sparkdash] {note}")
@@ -257,13 +350,11 @@ class RecipeController:
             rc = await self._stream(
                 ["sparkrun", "run", recipe, *_mode_flags(mode), "--no-follow"])
             if rc != 0:
-                self._finish(False, "Start failed", f"sparkrun run exited {rc}")
+                self._finish(False, f"Start failed: {self._last_error_line()}",
+                             f"sparkrun run exited {rc}")
                 return
-            if await self._wait_healthy():
+            if await self._wait_ready(await self._await_job(), "Start"):
                 self._finish(True, "Recipe running — vLLM healthy")
-            else:
-                self._finish(False, "Started, but vLLM did not become healthy in time",
-                             "health timeout")
         except Exception as exc:
             self._finish(False, "Start failed", f"{type(exc).__name__}: {exc}")
 
@@ -296,6 +387,7 @@ class RecipeController:
             # Capture the effective recipe first so it can be re-run later even
             # if it isn't in any registry (best-effort; never blocks the stop).
             await self._preserve(rec)
+            await self._snapshot_logs_if_sick(rec)
             self._touch(phase="stopping", recipe=rec.get("name"),
                         message=f"Stopping {rec.get('name')}")
             rc = await self._stream(
@@ -349,6 +441,7 @@ class RecipeController:
             tmp = f"{_RECIPE_TMP}/{base}.yaml"
             os.replace(raw, tmp)
 
+            await self._snapshot_logs_if_sick(rec)
             self._touch(phase="stopping", message=f"Stopping {rec.get('name')}")
             rc = await self._stream(
                 ["sparkrun", "stop", rec["id"], "--cluster", config.SPARKRUN_CLUSTER])
@@ -363,13 +456,11 @@ class RecipeController:
             rc = await self._stream(
                 ["sparkrun", "run", tmp, *_mode_flags(use_mode), "--no-follow"])
             if rc != 0:
-                self._finish(False, "Restart failed (run)", f"run exited {rc}")
+                self._finish(False, f"Restart failed (run): {self._last_error_line()}",
+                             f"run exited {rc}")
                 return
-            if await self._wait_healthy():
+            if await self._wait_ready(await self._await_job(), "Restart"):
                 self._finish(True, "Recipe restarted — vLLM healthy")
-            else:
-                self._finish(False, "Restarted, but vLLM did not become healthy",
-                             "health timeout")
         except Exception as exc:
             self._finish(False, "Restart failed", f"{type(exc).__name__}: {exc}")
 

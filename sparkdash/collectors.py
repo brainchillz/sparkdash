@@ -24,7 +24,7 @@ from typing import Any
 
 import httpx
 
-from . import config, engines
+from . import config, engines, launch
 
 # Remote one-shot probe: sum per-process VRAM (MiB), read root fs used/total
 # bytes, and list sparkrun containers (for orphan detection — a container
@@ -64,6 +64,7 @@ class Hub:
         self._spec_state: dict[str, Any] = {}
         self._spec_low_streak = 0
         self._recipe: dict[str, Any] = {"running": False}
+        self._noted_job: str | None = None
         self._client = httpx.AsyncClient(timeout=4.0)
         self._tasks: list[asyncio.Task] = []
         # Recent collector failures, surfaced in the snapshot so a broken
@@ -377,7 +378,18 @@ class Hub:
             stderr=asyncio.subprocess.DEVNULL,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
-        self._recipe = _parse_status(out.decode(errors="replace"))
+        rec = _parse_status(out.decode(errors="replace"))
+        if rec.get("running"):
+            # Is the serve process inside the head container alive? A dead
+            # vLLM leaves the container "Up", so this is what tells "still
+            # loading" from "died at startup" (watchdog grace, UI banner).
+            cont = await launch.head_container(rec["id"])
+            rec["serve_alive"] = await launch.serve_alive(cont) if cont else None
+            if rec["id"] != self._noted_job:
+                self._noted_job = rec["id"]
+                from . import recipe_ops   # lazy: recipe_ops imports this module
+                recipe_ops.note_running(rec)
+        self._recipe = rec
 
     # -- sparkrun version --------------------------------------------------
 
@@ -717,13 +729,18 @@ def _f(val: Any) -> float | None:
 _JOB_RE = re.compile(
     r"Job:\s+(?P<name>\S+)\s+\(tp=(?P<tp>\d+)(?:,\s*pp=(?P<pp>\d+))?\)\s+\[(?P<id>[0-9a-f_]+)\]"
 )
-# Container line, e.g.: "  head  <host>  Up 5 days  vllm-node-xxxxx"
-# Single-node jobs report role "solo".
-# sparkrun 0.3.x cluster jobs print roles node_0/node_1/... instead of
-# head/worker; missing them empties the container list, which downstream
-# reads as a solo job — and a "solo" restart of a tp=2 recipe crashes vLLM.
+# Container line, from sparkrun's `f"  {role:<10s} {hdisp:<40s} {status:<25s} {image}"`,
+# e.g.: "  node_0     10.0.0.5 (ib: 10.0.1.5)   Up 5 days   ghcr.io/x/y:tag"
+# Single-node jobs report role "solo". sparkrun 0.3.x cluster jobs print roles
+# node_0/node_1/... instead of head/worker; missing them empties the container
+# list, which downstream reads as a solo job — and a "solo" restart of a tp=2
+# recipe crashes vLLM. The host may carry a "(mgmt: …)" / "(ib: …)" annotation
+# (it did on 2026-11-15, and the old pattern then counted 0/4 containers up and
+# the watchdog restarted a live job). Any status is kept (Exited/Restarting
+# too) so a down rank is reported, not silently dropped.
 _CONT_RE = re.compile(
-    r"^\s+(head|worker|solo|node_\d+)\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<status>Up[^\n]*?)\s{2,}\S+\s*$"
+    r"^\s+(head|worker|solo|node_\d+)\s+(?P<ip>[\w.\-]+)(?:\s+\([^)]*\))?"
+    r"\s+(?P<status>\S.*?)\s+(?P<image>\S+)\s*$"
 )
 
 

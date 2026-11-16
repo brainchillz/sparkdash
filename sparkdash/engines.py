@@ -21,7 +21,7 @@ import re
 # Normalized names every consumer understands. Values are 0-1 for the cache
 # ratio, monotonic counters for the *_total names.
 _METRIC_RE = re.compile(
-    r"^((?:vllm|sglang|llamacpp):[a-zA-Z_]+)(?:\{[^}]*\})?\s+([0-9eE.+\-]+)$")
+    r"^((?:vllm|sglang|llamacpp|tensorfold):[a-zA-Z_]+)(?:\{[^}]*\})?\s+([0-9eE.+\-]+)$")
 
 _WANTED = {
     "vllm:num_requests_running",
@@ -67,7 +67,27 @@ _LLAMACPP_MAP = {
     "llamacpp:spec_decode_num_accepted_tokens_total": "vllm:spec_decode_num_accepted_tokens_total",
 }
 
-_MAPS = {"sglang": _SGLANG_MAP, "llamacpp": _LLAMACPP_MAP, "vllm": {}}
+# TensorFold's native engine (bertholomus fork, the DeepSeek-V4.1 TP4 lane)
+# already mirrors most of vLLM's names under its own prefix. Two quirks are
+# handled in parse_metrics: kv_cache_usage_perc is one sample per stream
+# (averaged, not summed), and requests_total carries a status label (only the
+# 200s count as successes). decode_rounds_total is the number of DSpark
+# draft-verify rounds, the same thing vLLM counts as drafts, so the
+# acceptance watch works unchanged.
+_TENSORFOLD_MAP = {
+    "tensorfold:num_requests_running": "vllm:num_requests_running",
+    "tensorfold:num_requests_waiting": "vllm:num_requests_waiting",
+    "tensorfold:kv_cache_usage_perc": "vllm:kv_cache_usage_perc",
+    "tensorfold:prompt_tokens_total": "vllm:prompt_tokens_total",
+    "tensorfold:generation_tokens_total": "vllm:generation_tokens_total",
+    "tensorfold:requests_total": "vllm:request_success_total",
+    "tensorfold:decode_rounds_total": "vllm:spec_decode_num_drafts_total",
+    "tensorfold:spec_decode_num_draft_tokens_total": "vllm:spec_decode_num_draft_tokens_total",
+    "tensorfold:spec_decode_num_accepted_tokens_total": "vllm:spec_decode_num_accepted_tokens_total",
+}
+
+_MAPS = {"sglang": _SGLANG_MAP, "llamacpp": _LLAMACPP_MAP,
+         "tensorfold": _TENSORFOLD_MAP, "vllm": {}}
 
 
 def parse_metrics(text: str) -> tuple[dict[str, float], str | None]:
@@ -78,6 +98,7 @@ def parse_metrics(text: str) -> tuple[dict[str, float], str | None]:
     """
     out: dict[str, float] = {}
     engine: str | None = None
+    kv_samples = 0   # TensorFold: one kv_cache_usage_perc sample per stream
     for line in text.splitlines():
         if line.startswith("#") or "_created" in line:
             continue
@@ -87,12 +108,19 @@ def parse_metrics(text: str) -> tuple[dict[str, float], str | None]:
         name, value = m.group(1), m.group(2)
         prefix = name.split(":", 1)[0]
         engine = engine or prefix
+        if prefix == "tensorfold" and name == "tensorfold:requests_total" \
+                and 'status="200"' not in line:
+            continue
         name = _MAPS[prefix].get(name, name)
         if name in _WANTED or name == "prefix_cache_hit_rate":
             try:
                 out[name] = out.get(name, 0.0) + float(value)
             except ValueError:
-                pass
+                continue
+            if prefix == "tensorfold" and name == "vllm:kv_cache_usage_perc":
+                kv_samples += 1
+    if kv_samples > 1:
+        out["vllm:kv_cache_usage_perc"] /= kv_samples
     # Derived: prefix-cache hit rate (vLLM exposes the two counters instead;
     # llama.cpp has no queries counter — every prompt token is a query).
     q = out.get("vllm:prefix_cache_queries_total", 0.0)

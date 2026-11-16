@@ -16,6 +16,14 @@ operation is in progress, and no automatic restart happened within the
 cooldown — restarts the engine through the same controller the admin UI
 uses, so the restart shows up in the operation panel with streamed output.
 
+A sparkrun recipe is only restarted automatically once this launch has been
+seen serving (containers up, /health 200, canary not failing). A launch that
+never got that far is alerted on and left alone: relaunching it would re-run
+whatever made it fail. On 2026-11-15 a recipe with an unbounded KV-cache size
+exhausted memory on all four nodes, and when the nodes were power-cycled the
+watchdog began launching it again. Stacks are fixed, configured engines and
+are always restarted.
+
 Nothing is guarded when nothing is there: a deliberate stop removes the
 containers (recipes via sparkrun, stacks via their script), so no marker file
 or "desired state" is needed. The check loop keeps a small state dict that the
@@ -28,6 +36,7 @@ and the per-stack cron watchdogs it was modelled on.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from . import alerts, config, ops, store
@@ -83,7 +92,14 @@ def _evaluate(snap: dict) -> str | None:
         if age is None:
             age = _recipe_age_min(snap)
         if age is not None and age < config.WATCHDOG_GRACE_MIN:
-            return None   # still starting
+            # Still starting — unless the serve process is already gone. A
+            # dead vLLM leaves its container "Up" (PID 1 is sleep infinity),
+            # which used to read as "loading" for the whole grace period.
+            if eng["owner"] == "sparkrun" and \
+                    (snap.get("recipe") or {}).get("serve_alive") is False:
+                return (f"vLLM process exited inside the head container "
+                        f"{age:.0f} min after launch (containers still up)")
+            return None
         return ("/health not answering" if not vllm.get("reachable")
                 else "/health failing") + (f" after {age:.0f} min up" if age is not None else "")
     canary = snap.get("canary") or {}
@@ -120,6 +136,50 @@ async def _restart(snap: dict) -> None:
         raise RuntimeError(op.get("error") or op.get("message") or "restart failed")
 
 
+# -- "has this launch ever served?" ------------------------------------------
+
+_PROVEN_KEY = "watchdog.proven_recipe"
+_PROVEN_SLACK = 120      # s; container age is reported in whole minutes
+
+
+def _proven_load() -> dict:
+    try:
+        return json.loads(store.get_setting(_PROVEN_KEY) or "{}") or {}
+    except ValueError:
+        return {}
+
+
+def _mark_proven(rid: str | None) -> None:
+    """Record that sparkrun job `rid` was seen serving just now."""
+    if not rid:
+        return
+    cur = _proven_load()
+    now = time.time()
+    if cur.get("id") == rid and now - (cur.get("ts") or 0) < 600:
+        return
+    store.set_setting(_PROVEN_KEY, json.dumps({"id": rid, "ts": now}))
+
+
+def _is_proven(snap: dict) -> bool:
+    """True when the running sparkrun job has served since its containers started.
+
+    sparkrun derives the job id from the cluster and model, so two launches of
+    different recipes for the same model share an id; the timestamp is what
+    ties the record to this launch. Stored (not in memory) so a sparkdash
+    restart does not forget it.
+    """
+    rid = (snap.get("recipe") or {}).get("id")
+    cur = _proven_load()
+    if not rid or cur.get("id") != rid:
+        return False
+    age = (snap.get("engine") or {}).get("youngest_min")
+    if age is None:
+        age = _recipe_age_min(snap)
+    if age is None:
+        return True
+    return (cur.get("ts") or 0) >= time.time() - age * 60 - _PROVEN_SLACK
+
+
 # -- loop --------------------------------------------------------------------
 
 async def check(hub) -> None:
@@ -151,6 +211,8 @@ async def check(hub) -> None:
             await alerts.send("recovered", f"{eng['label']} is serving again.")
         state.update(failures=0, last_reason=None, last_alert=None,
                      last_status=f"ok: {eng['label']} {eng['up']}/{eng['expected']} containers, healthy")
+        if eng["owner"] == "sparkrun" and (snap.get("vllm") or {}).get("healthy"):
+            _mark_proven((snap.get("recipe") or {}).get("id"))
         return
     state["failures"] += 1
     state["last_reason"] = reason
@@ -161,6 +223,12 @@ async def check(hub) -> None:
     if state["last_alert"] != reason:
         await alerts.send("engine dead", f"{eng['label']}: {reason}")
         state["last_alert"] = reason
+    if eng["owner"] == "sparkrun" and not _is_proven(snap):
+        msg = f"dead ({reason}); this launch never served, so it is not restarted automatically"
+        if state["last_status"] != msg:
+            print(f"[sparkdash] watchdog: {msg}", flush=True)
+        state["last_status"] = msg
+        return
     offline = [n["name"] for n in snap.get("nodes", []) if not n.get("online")]
     if offline:
         msg = f"waiting: node(s) offline: {', '.join(offline)}"
@@ -184,6 +252,11 @@ async def check(hub) -> None:
     try:
         await _restart(snap)
     except Exception as exc:
+        if eng["owner"] == "sparkrun":
+            # Same effective recipe as the one that served: keep retrying on
+            # the cooldown, as before, instead of giving up after one attempt.
+            store.set_setting(_PROVEN_KEY, json.dumps(
+                {"id": (snap.get("recipe") or {}).get("id"), "ts": time.time()}))
         state.update(last_status=f"restart failed: {exc}")
         await alerts.send("restart failed", f"{eng['label']}: {exc}")
         return
